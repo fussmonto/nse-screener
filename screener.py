@@ -10,7 +10,8 @@ Pipeline
      rank with a transparent 100-point score (trend, RSI, volume, momentum,
      fundamentals) and keep the top N per bracket.
   5. Derive buy zone, 1-4 week target, 1-3 month target and stop-loss.
-  6. Render an HTML dashboard (docs/index.html) and email it.
+  6. Run the 22-filter quality small-cap screen (quality.py) on liquid, trending names.
+  7. Render an HTML dashboard (docs/index.html) and email it.
 
 IMPORTANT: at 08:30 IST the market has not opened, so "CMP" is the previous
 session's closing price.  Educational / research use only - not investment advice.
@@ -38,6 +39,11 @@ from urllib.parse import quote
 import numpy as np
 import pandas as pd
 import requests
+
+try:  # 22-filter quality small-cap screen (quality.py, same folder). Optional: the daily report
+    import quality  # must still go out if that file was not uploaded.
+except ImportError:  # pragma: no cover
+    quality = None
 
 log = logging.getLogger("screener")
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -286,6 +292,7 @@ def compute_features(df: pd.DataFrame, cfg: Config, today: datetime | None = Non
         "chg_pct": float((c.iloc[-1] / c.iloc[-2] - 1) * 100),
         "ema20": float(e20.iloc[-1]), "ema50": float(e50.iloc[-1]),
         "ema200": float(e200.iloc[-1]) if not math.isnan(float(e200.iloc[-1])) else math.nan,
+        "sma200": float(c.iloc[-200:].mean()) if len(c) >= 200 else math.nan,
         "rsi": float(rsi.iloc[-1]), "atr": a,
         "vol": float(v.iloc[-1]), "vol_avg20": vol_avg20,
         "vol_ratio": float(v.iloc[-1] / vol_avg20) if vol_avg20 > 0 else 0.0,
@@ -623,7 +630,11 @@ def render_html(report: dict, cfg: Config, web: bool = True) -> str:
     nav = ""
     if web:
         nav = '<div class="nav">' + "".join(
-            f'<a href="#b{i}">{escape(b["label"])}</a>' for i, b in enumerate(report["brackets"])) + "</div>"
+            f'<a href="#b{i}">{escape(b["label"])}</a>' for i, b in enumerate(report["brackets"]))
+        if report.get("quality"):
+            nav += '<a href="#quality">Quality shortlist</a>'
+        nav += "</div>"
+    quality_html = quality.render_html_section(report["quality"]) if report.get("quality") else ""
 
     sections = []
     for i, b in enumerate(report["brackets"]):
@@ -681,7 +692,7 @@ def render_html(report: dict, cfg: Config, web: bool = True) -> str:
         f"<h1>NSE Daily Price-Bracket Screener</h1>"
         f'<div class="sub">Based on closing prices of <strong>{d}</strong> (last completed session) · '
         f"generated {gen} · CMP = last close, not a live quote</div>"
-        f"{market}{nav}{''.join(sections)}{method}"
+        f"{market}{nav}{quality_html}{''.join(sections)}{method}"
         f'<div class="sm" style="margin-top:8px">{stats_line}</div>'
         f'<div class="foot">{DISCLAIMER}</div></div></body></html>'
     )
@@ -690,6 +701,8 @@ def render_html(report: dict, cfg: Config, web: bool = True) -> str:
 def render_text(report: dict) -> str:
     out = [f"NSE Daily Price-Bracket Screener - data as of {report['data_date']}",
            "(Open the attached HTML for the full tables.)", ""]
+    if report.get("quality"):
+        out.append(quality.render_text_section(report["quality"]))
     for b in report["brackets"]:
         out.append(f"== {b['label']} ==")
         for r in b["rows"]:
@@ -764,6 +777,7 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--no-email", action="store_true", help="generate report but do not send email")
     ap.add_argument("--force", action="store_true", help="run even if no new trading session since last run")
+    ap.add_argument("--no-quality", action="store_true", help="skip the 22-filter quality small-cap screen")
     ap.add_argument("--limit", type=int, default=0, help="debug: only screen the first N symbols")
     ap.add_argument("--universe", choices=["total", "500"], default=os.environ.get("UNIVERSE", "total"))
     ap.add_argument("-v", "--verbose", action="store_true")
@@ -802,6 +816,26 @@ def main(argv: list[str] | None = None) -> int:
 
     report = run_screen(hist, names, cfg, lambda syms: fetch_fundamentals(syms, cfg), now)
     report["market"] = market_context(cfg)
+    run_quality = not args.no_quality and os.environ.get("QUALITY_SCREEN", "1").lower() not in ("0", "false", "no")
+    if run_quality and quality is None:
+        log.error("quality.py not found next to screener.py - skipping the quality shortlist")
+        run_quality = False
+    if run_quality:
+        try:   # a failure here must never stop the main report or the email
+            qcfg = quality.QualityConfig(data_dir=cfg.data_dir)
+            feats = {}
+            for sym, df in hist.items():
+                f = compute_features(df, cfg, now)
+                if f is not None:
+                    feats[sym] = f
+            industries = dict(zip(uni["symbol"], uni["industry"].fillna("").astype(str)))
+            report["quality"] = quality.screen(
+                feats, names, industries, qcfg, compute_levels,
+                lambda syms: quality.fetch_metrics(syms, qcfg))
+            log.info("Quality screen: %d shortlisted, %d evaluated", len(report["quality"]["rows"]),
+                     report["quality"]["stats"]["evaluated"])
+        except Exception as exc:  # noqa: BLE001
+            log.error("Quality screen failed (report continues without it): %s", exc)
     report["generated_at"] = now.strftime("%d %b %Y, %H:%M IST")
     html = render_html(report, cfg, web=True)
     write_outputs(report, html, cfg)

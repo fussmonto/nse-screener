@@ -36,9 +36,61 @@ Stock name + NSE ticker · CMP · buy zone · target 1–4 weeks · target 1–3
 
 Bracket edges are contiguous: a close of ₹100.50 falls in "₹101 – ₹200".
 
+## Quality small-cap shortlist (22 filters) - `quality.py`
+A second, **long-horizon** screen runs after the price-bracket screen and adds a *Quality small-cap shortlist*
+at the top of the email and dashboard. It is meant for equal-weight, buy-and-hold research (about 10-12 names,
+reviewed roughly once a year) - not for short-term trading. It has no price cap: it filters on market cap.
+
+| # | Filter | Type |
+|---|---|---|
+| 1 | Market cap ₹300 - 8,000 cr | hard |
+| 2 | Average daily traded value > ₹1 cr | hard |
+| 3 | ROCE > 18% | hard |
+| 4 | ROE > 15% | hard |
+| 5 | Operating margin > 12% | hard |
+| 6 | Sales growth, 3-year CAGR > 15% | hard |
+| 7 | Profit growth, 3-year CAGR > 15% | hard |
+| 8 | Latest-quarter profit growth > 0% YoY | hard |
+| 9 | Debt/equity < 0.5 | hard |
+| 10 | Interest cover > 4× | hard |
+| 11 | Promoter pledging < 5% | **manual** (not in free data) |
+| 12 | Operating cash flow positive last year | hard |
+| 13 | Promoter holding > 40% | hard |
+| 14 | FII + DII holding > 5% | hard |
+| 15 | P/E < 25 (loss-making fails) | hard |
+| 16 | Price above 200-day average | hard |
+| 17 | PEG < 1.5 | hard |
+| 18 | Operating cash flow ≥ 70% of profit (3-year) | soft |
+| 19 | Free cash flow positive in ≥ 2 of the last 3 years | soft |
+| 20 | Receivable days not rising sharply | soft |
+| 21 | Share count up < 5% over 3 years | soft |
+| 22 | Average ROCE (3-4 years) > 15% | soft |
+
+**How the shortlist is built**
+* Pre-screen on price data already downloaded (filters 2 and 16), then fetch fundamentals for the survivors only.
+* **Full match** = all 16 automated hard filters and all 5 soft checks pass. **Near match** = every hard filter that has data
+  passes (at most 2 may lack data) and at most 2 soft checks fail; the report says exactly which.
+* A stock that *fails* a hard filter is never shortlisted; missing data is shown as "No data", never silently treated as a pass.
+* Banks, NBFCs and insurers are excluded (ROCE, debt/equity and interest cover mean something different for lenders).
+* Ranked by a transparent quality score (ROCE 35, sales growth 25, profit growth 25, cheapness 15); **max 2 stocks per sector**.
+  Top 15 are shown, plus the 10 closest misses.
+* Buy zone and stop-loss reuse the same ATR / pivot / Fibonacci logic as the bracket screen, as an entry guide only.
+* Thresholds are all in the `QualityConfig` dataclass at the top of `quality.py`. Turn the screen off with
+  `QUALITY_SCREEN=0` or `python screener.py --no-quality`. If it fails for any reason the main report and email still go out.
+
+**Data coverage.** Fundamentals come from Yahoo Finance (income statement, balance sheet, cash flow). Each run fetches for
+up to 7 minutes and caches results in `data/quality_cache.json` (refreshed every 10 days), so **coverage grows over the first
+few daily runs**; the report states how many candidates have data. Yahoo gives only 3-4 years of statements, so "3-year" growth
+and "multi-year ROCE" use that window. Promoter and institutional holding are Yahoo approximations, and a bonus issue or
+split can trigger a false "share dilution" flag.
+
+**You must still check by hand** (the screen cannot): promoter pledging (filter 11), auditor changes or qualified opinions,
+related-party dealings, and the latest annual report and two earnings-call summaries. Past screens do not predict future returns;
+most of any one portfolio's result usually comes from one or two stocks.
+
 ## Setup (≈15 minutes, free)
 1. **Create a GitHub repo** (github.com → New). *Public* is recommended: unlimited Actions minutes and free GitHub Pages. Private repos get 2,000 min/month (this job uses ~10 min/day ≈ 220/month) but need a paid plan for Pages.
-2. **Upload this folder's contents**, keeping the structure: `screener.py`, `requirements.txt`, `README.md`, `.gitignore`, `tests/`, and `.github/workflows/daily-screener.yml`. (Unzip first; drag the files into the repo page → Commit. If `.github` is hidden on your OS, enable "show hidden files".)
+2. **Upload this folder's contents**, keeping the structure: `screener.py`, `quality.py`, `requirements.txt`, `README.md`, `.gitignore`, `tests/`, and `.github/workflows/daily-screener.yml`. (Unzip first; drag the files into the repo page → Commit. If `.github` is hidden on your OS, enable "show hidden files".)
 3. **Gmail App Password**: Google Account → Security → turn on 2-Step Verification → search "App passwords" → create one named `screener` → copy the 16 characters.
 4. **Add secrets**: repo → Settings → Secrets and variables → Actions → New repository secret:
 
@@ -65,8 +117,9 @@ pip install -r requirements.txt
 python tests/test_offline.py        # logic tests, no network needed
 python screener.py --no-email       # real run; writes docs/index.html
 python screener.py --limit 60 -v    # quick debug run on 60 symbols
+python screener.py --no-quality     # skip the 22-filter quality shortlist
 ```
-Tuning (environment variables): `UNIVERSE=500`, `MIN_TURNOVER_CR=5`, `MIN_PRICE=20`. Everything else is in the `Config` dataclass at the top of `screener.py`.
+Tuning (environment variables): `UNIVERSE=500`, `MIN_TURNOVER_CR=5`, `MIN_PRICE=20`, `QUALITY_SCREEN=0`. Everything else is in the `Config` dataclass at the top of `screener.py`.
 
 ## Known limitations
 * Yahoo Finance via `yfinance` is unofficial: it can rate-limit shared GitHub IPs, change formats, or serve occasional bad data. If a run fails, re-run it; if it keeps failing, upgrade `yfinance`.
