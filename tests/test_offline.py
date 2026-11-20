@@ -144,7 +144,7 @@ def test_render_and_outputs(rep):
     mail = S.render_html(rep, cfg, web=False)
     for h in (web, mail):
         assert "educational and" in h and "research purposes only" in h, "disclaimer present"
-        assert h.count("<table>") == sum(1 for b in rep["brackets"] if b["rows"])
+        assert h.count("<table>") == sum(1 for b in rep["brackets"] if b["rows"]) + (1 if rep.get("fresh") else 0)
     assert 'href="#b0"' in web and 'href="#b0"' not in mail
     kb = len(mail.encode()) / 1024
     print(f"ok  render     (email html {kb:.0f} KB; Gmail clips ~102 KB)")
@@ -408,7 +408,8 @@ def test_quality_render(q):
     cfg = S.Config()
     html = Q.render_html_section(q)
     assert 'id="quality"' in html and "The 22 filters" in html and "promoter pledging" in html
-    assert html.count("<table>") == 1
+    has_funnel = bool(q["funnel"]["n_small"] and q["funnel"]["rows"])
+    assert html.count("<table>") == 1 + (1 if has_funnel else 0)
     txt = Q.render_text_section(q)
     assert "Quality small-cap shortlist" in txt and q["rows"][0]["symbol"] in txt
     bad = json.loads(json.dumps(q, default=str))
@@ -421,7 +422,7 @@ def test_quality_render(q):
     rep = dict(rep, generated_at="13 Nov 2026, 08:30 IST", market={}, quality=q)
     web, mail = S.render_html(rep, cfg, web=True), S.render_html(rep, cfg, web=False)
     assert 'href="#quality"' in web and 'href="#quality"' not in mail and 'id="quality"' in mail
-    assert "Quality small-cap shortlist" in S.render_text(rep)
+    assert "Quality small-cap shortlist" in S.render_text(rep) and "Fresh signals today" in S.render_text(rep)
     kb = len(mail.encode()) / 1024
     assert kb < 100, f"email {kb:.0f} KB would be clipped by Gmail"
     print(f"ok  quality render (email html {kb:.0f} KB)")
@@ -512,6 +513,241 @@ def test_main_with_quality():
     print("ok  main() with quality (section, email text, --no-quality, failure isolation)")
 
 
+# --------------------------------------------------------------------------- #
+# Variety (rotation, fresh signals, pick history) and the wider universe
+# --------------------------------------------------------------------------- #
+def breakout_df():
+    """Own RNG (does not disturb the shared one): steady uptrend, last bar closes above the 52-week high on 2.5x volume."""
+    rng = np.random.default_rng(11)
+    n = len(DATES)
+    close = 100 * np.exp(np.cumsum(rng.normal(0.0008, 0.008, n)))
+    high, low = close * 1.004, close * 0.996
+    vol = np.full(n, 2_000_000.0)
+    close[-1] = high[-253:-1].max() * 1.002
+    high[-1], low[-1], vol[-1] = close[-1] * 1.001, close[-2], 5_000_000.0
+    return pd.DataFrame({"Open": close, "High": high, "Low": low, "Close": close, "Volume": vol}, index=DATES)
+
+
+def test_streaks_and_history():
+    hist = {"2026-11-10": ["A", "B", "C"], "2026-11-11": ["A", "B"], "2026-11-12": ["A", "D"]}
+    st = S.compute_streaks(hist, "2026-11-13")
+    assert st == {"A": 3, "D": 1}, st               # B dropped out on 11-12, so its streak is 0
+    assert S.compute_streaks(hist, "2026-11-12") == {"A": 2, "B": 2}      # a same-day re-run ignores today's entry
+    assert S.compute_streaks(hist, "2026-11-10") is None and S.compute_streaks({}, "2026-11-13") is None
+    cfg = S.Config()
+    assert S.rotation_penalty("A", st, cfg) == 9.0 and S.rotation_penalty("Z", st, cfg) == 0.0
+    assert S.rotation_penalty("A", {"A": 40}, cfg) == cfg.rotation_pts * cfg.rotation_max_days   # capped
+    assert S.rotation_penalty("A", None, cfg) == 0.0
+    with tempfile.TemporaryDirectory() as d:
+        cfg.data_dir = Path(d) / "data"
+        assert S.load_pick_history(cfg) == {}
+        h = {}
+        for i in range(20):
+            S.save_pick_history(cfg, h, f"2026-10-{i + 1:02d}", ["Z", "A"])
+            h = S.load_pick_history(cfg)
+        assert len(h) == cfg.pick_history_days and min(h) == "2026-10-06" and h["2026-10-20"] == ["A", "Z"], sorted(h)
+        (cfg.data_dir / "pick_history.json").write_text("{not json")
+        assert S.load_pick_history(cfg) == {}, "corrupt history must not crash the run"
+    print("ok  streaks + pick history")
+
+
+def test_rotation_in_ranking():
+    cfg = S.Config()
+    hist, names = build_universe()
+    base = S.run_screen(hist, names, cfg, fake_funds, NOW)
+    assert all(r["streak"] is None for b in base["brackets"] for r in b["rows"]), "no history => no badges"
+    tops = {b["rows"][0]["symbol"] for b in base["brackets"] if len(b["rows"]) >= 4}
+    assert tops
+    streaks = {s: 5 for s in tops}
+    rot = S.run_screen(hist, names, cfg, fake_funds, NOW, streaks)
+    moved = 0
+    for b0, b1 in zip(base["brackets"], rot["brackets"]):
+        for r in b1["rows"]:
+            exp = 5 if r["symbol"] in tops else 0
+            assert r["streak"] == exp
+            assert abs(r["rank_score"] - (r["score"] - cfg.rotation_pts * exp)) < 0.11, r
+        ranks = [(x["strict"], x["rank_score"]) for x in b1["rows"]]
+        assert ranks == sorted(ranks, reverse=True), "ordered by rank_score after rotation"
+        if b0["rows"] and b0["rows"][0]["symbol"] in tops and len(b1["rows"]) > 1:
+            old = {x["symbol"]: x["rank"] for x in b0["rows"]}
+            new = {x["symbol"]: x["rank"] for x in b1["rows"]}
+            top = b0["rows"][0]["symbol"]
+            assert top not in new or new[top] >= old[top], "a repeated leader must never move up"
+            moved += new.get(top, 99) > old[top]
+    assert moved >= 1, "rotation should demote at least one repeated leader in this synthetic universe"
+    print("ok  rotation demotes repeated names (", moved, "brackets changed )")
+
+
+def test_fresh_signals():
+    base = dict(close=100.0, ema50=95.0, ema200=80.0, rsi=60.0, vol_ratio=1.0, prior_hi20=105.0,
+                prior_hi52=110.0, chg_pct=0.5)
+    assert S.fresh_signal(base) is None
+    assert S.fresh_signal(dict(base, close=112.0, vol_ratio=1.3)) == ("New 52-week high", 3)
+    assert S.fresh_signal(dict(base, close=106.0, vol_ratio=1.6, prior_hi52=120.0)) == ("20-day breakout on volume", 2)
+    assert S.fresh_signal(dict(base, vol_ratio=2.6, chg_pct=3.0))[1] == 1
+    assert S.fresh_signal(dict(base, close=112.0, vol_ratio=1.0)) is None, "breakout needs volume"
+    assert S.fresh_signal(dict(base, close=112.0, vol_ratio=1.3, ema200=130.0)) is None, "below 200 EMA"
+    assert S.fresh_signal(dict(base, close=112.0, vol_ratio=1.3, rsi=85.0)) is None, "too stretched"
+    assert S.fresh_signal(dict(base, close=112.0, vol_ratio=1.3, ema200=math.nan)) is None
+    # end to end: an engineered breakout stock must be reported, bad/illiquid ones must not
+    hist, names = build_universe()
+    hist["BRK"], names["BRK"] = breakout_df(), "Breakout Co"
+    f = S.compute_features(hist["BRK"], S.Config(), NOW)
+    assert S.fresh_signal(f) is not None, {k: f[k] for k in ("close", "prior_hi52", "vol_ratio", "rsi", "ema200")}
+    rep = S.run_screen(hist, names, S.Config(), fake_funds, NOW)
+    fr = rep["fresh"]
+    assert any(r["symbol"] == "BRK" and r["signal"] == "New 52-week high" for r in fr), fr
+    assert [(r["prio"], r["vol_ratio"]) for r in fr] == sorted([(r["prio"], r["vol_ratio"]) for r in fr], reverse=True)
+    assert len(fr) <= S.Config().fresh_top_n and not any(r["symbol"] in ("ILLIQ", "PENNY", "SPLIT", "DEAD", "BIG") for r in fr)
+    assert all(r["sl"] < r["cmp"] < r["st"] for r in fr)
+    for r in fr:                                            # breakout levels: stop 1.5 ATR below, target 3 ATR above CMP
+        assert 0.6 < (r["st"] - r["cmp"]) / max(r["cmp"] - r["sl"], 1e-9) < 2.5 and r["st_pct"] > 2.0, r
+    rep.update(generated_at="13 Nov 2026, 08:30 IST", market={})
+    html, txt = S.render_html(rep, S.Config(), web=True), S.render_text(rep)
+    assert 'id="fresh"' in html and 'href="#fresh"' in html and "Breakout Co" in html and "BRK" in txt
+    assert "<script" not in S.render_html(dict(rep, fresh=[dict(fr[0], name="<script>x</script>")]), S.Config())
+    none_html = S.render_html(dict(rep, fresh=[]), S.Config())
+    assert "No breakout or volume-surge signals today" in none_html
+    assert 'id="fresh"' not in S.render_html({k: v for k, v in rep.items() if k != "fresh"}, S.Config())
+    print("ok  fresh signals (", len(fr), "reported )")
+
+
+def test_universe_all():
+    def csv_total():
+        rows = ["Company Name,Industry,Symbol,Series,ISIN Code"] + [f"Tot {i} Ltd,Industrials,T{i},EQ,INE{i}" for i in range(120)]
+        return "\n".join(rows)
+
+    def csv_equity():
+        rows = ["SYMBOL,NAME OF COMPANY, SERIES, DATE OF LISTING"]
+        rows += [f"T{i},Tot {i} Ltd,EQ,01-JAN-2000" for i in range(60)]                 # duplicates of the Total Market list
+        rows += [f"E{i},Extra {i} Ltd,{'BE' if i < 50 else 'EQ'},01-JAN-2010" for i in range(1200)]
+        return "\n".join(rows)
+
+    state = {"fail_all": False}
+
+    def fake_get(url, headers=None, timeout=None):
+        if "EQUITY_L" in url:
+            if state["fail_all"]:
+                raise RuntimeError("blocked")
+            text = csv_equity()
+        elif "niftytotalmarket" in url:
+            text = csv_total()
+        else:
+            raise RuntimeError("unexpected url " + url)
+        return types.SimpleNamespace(text=text, raise_for_status=lambda: None)
+
+    assert S.Config().universe == "all"
+    with tempfile.TemporaryDirectory() as d, mock.patch.object(S.requests, "get", fake_get), \
+            mock.patch.object(S.time, "sleep", lambda s: None):
+        cfg = S.Config(universe="all", data_dir=Path(d))
+        u = S.load_universe(cfg)
+        syms = list(u["symbol"])
+        assert len(syms) == 120 + 1150 and len(set(syms)) == len(syms), len(syms)
+        assert syms[:120] == [f"T{i}" for i in range(120)], "Total Market list comes first (priority if time runs out)"
+        assert "E49" not in syms and "E50" in syms, "only EQ series; BE (trade-to-trade) excluded"
+        assert dict(zip(u["symbol"], u["name"]))["E60"] == "Extra 60 Ltd"
+        assert dict(zip(u["symbol"], u["industry"]))["T5"] == "Industrials"
+        state["fail_all"] = True                                             # NSE blocks the full list -> cached copy
+        assert len(S.load_universe(cfg)) == 1270
+    with tempfile.TemporaryDirectory() as d, mock.patch.object(S.requests, "get", fake_get), \
+            mock.patch.object(S.time, "sleep", lambda s: None):
+        state["fail_all"] = True                                             # blocked and no cache -> Total Market list
+        assert len(S.load_universe(S.Config(universe="all", data_dir=Path(d)))) == 120
+        assert len(S.load_universe(S.Config(universe="total", data_dir=Path(d)))) == 120
+    print("ok  universe=all (merge, dedupe, EQ only, cache fallback, total fallback)")
+
+
+def test_history_budget():
+    calls = []
+
+    def download(*a, **k):
+        calls.append(1)
+        return pd.DataFrame()
+
+    fake_yf = types.SimpleNamespace(download=download)
+    with mock.patch.dict(sys.modules, {"yfinance": fake_yf}), mock.patch.object(S.time, "sleep", lambda s: None):
+        assert S.fetch_history([f"S{i}" for i in range(250)], S.Config(history_budget_s=-1)) == {}
+        assert not calls, "an exhausted budget must stop before downloading anything"
+        S.fetch_history([f"S{i}" for i in range(250)], S.Config(history_budget_s=600))
+        assert len(calls) == 3, "250 symbols / chunk 100 = 3 downloads"
+    print("ok  history time budget")
+
+
+def test_quality_funnel_and_order():
+    cfg = Q.QualityConfig()
+    feats, names, industries, funds = quality_universe()
+    funds = {s: dict(m) for s, m in funds.items()}
+    for s, m in funds.items():
+        m["roe"] = 3.0                                   # every stock fails ROE
+        if s.endswith("X1"):
+            m["mcap_cr"] = 20000.0                       # large caps: fail the size filter
+    asked = []
+
+    def fetch(syms):
+        asked.extend(syms)
+        return {s: funds[s] for s in syms if s in funds}
+
+    q = Q.screen(feats, names, industries, cfg, S.compute_levels, fetch)
+    assert q["rows"] == [] and q["stats"]["too_liquid"] >= 1, q["stats"]
+    assert "BIG" not in asked, "large-cap turnover skips the fundamentals fetch"
+    keys = [abs(math.log(max(feats[s]["turnover_cr"], 0.01) / cfg.focus_turnover_cr)) for s in asked]
+    assert keys == sorted(keys), "fetch order: typical small-cap turnover first"
+    fn = q["funnel"]
+    assert fn["n_small"] > 0 and fn["rows"][0][0] == 4 and fn["rows"][0][2] == fn["n_small"], fn["rows"][:3]
+    assert all(n not in (1, 11) for n, *_ in fn["rows"]), "size filter and the manual filter are not in the funnel"
+    assert q["misses"] and all(not r["symbol"].endswith("X1") for r in q["misses"]), "misses must be inside the size range"
+    assert all(1 not in r["hard_fail"] and len(r["hard_fail"]) <= cfg.miss_max_hard_fail for r in q["misses"])
+    html, txt = Q.render_html_section(q), Q.render_text_section(q)
+    assert "Which filters remove the most stocks" in html and "ROE" in txt and "Closest misses" in txt
+    json.dumps(q, default=str)
+    print("ok  quality funnel, meaningful misses, fetch order")
+
+
+def test_main_variety():
+    """Two consecutive sessions: day 2 shows New / Day-N badges, the banner, and saves history."""
+    import os
+
+    hist, names = build_universe()
+    hist["BRK"], names["BRK"] = breakout_df(), "Breakout Co"
+    uni = pd.DataFrame({"symbol": list(names), "name": list(names.values()), "industry": ""})
+
+    class FakeDT(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return NOW
+
+    old = os.getcwd()
+    with tempfile.TemporaryDirectory() as d:
+        os.chdir(d)
+        try:
+            with mock.patch.object(S, "load_universe", lambda cfg: uni), \
+                 mock.patch.object(S, "fetch_history", lambda syms, cfg: hist), \
+                 mock.patch.object(S, "market_context", lambda cfg: {}), \
+                 mock.patch.object(S, "fetch_fundamentals", lambda syms, cfg: fake_funds(syms)), \
+                 mock.patch.object(S, "datetime", FakeDT):
+                assert S.main(["--no-email", "--no-quality"]) == 0
+                day1 = json.loads(Path("data/pick_history.json").read_text())
+                assert list(day1) == ["2026-11-12"] and len(day1["2026-11-12"]) > 20
+                html1 = Path("docs/index.html").read_text()
+                assert "Day 2" not in html1 and 'class="b bn"' not in html1, "first run: nothing to compare with"
+                assert "BRK" in html1 and 'id="fresh"' in html1
+                # pretend those picks were also listed the previous session, minus a few that become "New"
+                listed = day1["2026-11-12"]
+                prev = {"2026-11-11": listed[3:]}
+                Path("data/pick_history.json").write_text(json.dumps(prev))
+                assert S.main(["--no-email", "--no-quality", "--force"]) == 0
+                html2 = Path("docs/index.html").read_text()
+                assert "Day 2" in html2 and 'class="b bn">New' in html2 and "new</strong> since the previous session" in html2
+                rep = json.loads(Path("docs/latest.json").read_text())
+                streaks = [r["streak"] for b in rep["brackets"] for r in b["rows"]]
+                assert set(streaks) <= {0, 1} and 0 in streaks and 1 in streaks, set(streaks)
+                saved = json.loads(Path("data/pick_history.json").read_text())
+                assert set(saved) == {"2026-11-11", "2026-11-12"}
+        finally:
+            os.chdir(old)
+    print("ok  main() variety (first run, badges, banner, history saved)")
+
+
 if __name__ == "__main__":
     test_indicators()
     test_fundamentals()
@@ -527,4 +763,11 @@ if __name__ == "__main__":
     test_quality_render(quality_report)
     test_quality_fetch_cache()
     test_main_with_quality()
+    test_streaks_and_history()
+    test_rotation_in_ranking()
+    test_fresh_signals()
+    test_universe_all()
+    test_history_budget()
+    test_quality_funnel_and_order()
+    test_main_variety()
     print("\nALL TESTS PASSED")

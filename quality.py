@@ -45,6 +45,8 @@ class QualityConfig:
     mcap_min_cr: float = 300.0
     mcap_max_cr: float = 8000.0
     min_turnover_cr: float = 1.0        # 20-day average traded value, ₹ crore
+    max_turnover_cr: float = 250.0      # above this a stock is almost certainly a large cap: skip the fetch
+    focus_turnover_cr: float = 15.0     # fetch fundamentals first for stocks trading near this value (typical small caps)
     min_price: float = 10.0
     # 3-5: profitability (percent)
     roce_min: float = 18.0
@@ -74,10 +76,11 @@ class QualityConfig:
     max_soft_fails: int = 2
     top_n: int = 15
     sector_cap: int = 2
-    misses_n: int = 10
+    misses_n: int = 12
+    miss_max_hard_fail: int = 3
     # fetching
     cache_ttl_days: int = 10
-    budget_s: int = 420
+    budget_s: int = 300                 # 10 min price history + 7 min fundamentals + 5 min this < the 30-min workflow limit
     workers: int = 4
     data_dir: Path = Path("data")
 
@@ -394,13 +397,15 @@ def quality_score(m: dict, vals: dict, cfg: QualityConfig) -> float:
 # --------------------------------------------------------------------------- #
 def screen(feats: dict[str, dict], names: dict[str, str], industries: dict[str, str],
            cfg: QualityConfig, levels_fn, fetch) -> dict:
-    stats = {"universe": len(feats), "illiquid": 0, "anomaly": 0, "below_trend": 0,
+    stats = {"universe": len(feats), "illiquid": 0, "too_liquid": 0, "anomaly": 0, "below_trend": 0,
              "no_data": 0, "financials": 0, "evaluated": 0, "sector_capped": 0}
     cands = []
     for sym, f in feats.items():
         if (f["close"] < cfg.min_price or f["turnover_cr"] <= cfg.min_turnover_cr
                 or f["zero_vol_days"] > 2):
             stats["illiquid"] += 1
+        elif f["turnover_cr"] > cfg.max_turnover_cr:      # large caps: cannot pass the market-cap filter
+            stats["too_liquid"] += 1
         elif f["max_abs_ret60"] > 0.30:      # likely unadjusted split / bad tick
             stats["anomaly"] += 1
         else:
@@ -409,9 +414,12 @@ def screen(feats: dict[str, dict], names: dict[str, str], industries: dict[str, 
                 stats["below_trend"] += 1
             else:
                 cands.append(sym)
-    cands.sort(key=lambda s: -feats[s]["turnover_cr"])
+    # fetch order matters when the time budget is short: typical small caps first
+    cands.sort(key=lambda s: abs(math.log(max(feats[s]["turnover_cr"], 0.01) / cfg.focus_turnover_cr)))
     metrics = fetch(cands) if cands else {}
 
+    funnel = {n: [0, 0] for n in range(2, 23) if n not in MANUAL}
+    n_small = 0
     scored = []
     for s in cands:
         m = metrics.get(s)
@@ -424,6 +432,13 @@ def screen(feats: dict[str, dict], names: dict[str, str], industries: dict[str, 
             continue
         stats["evaluated"] += 1
         ev = evaluate(m, feats[s], cfg)
+        if ev["ok"][1] is True:                     # stocks inside the size range: which filters remove them?
+            n_small += 1
+            for n, cnt in funnel.items():
+                if ev["ok"][n] is False:
+                    cnt[0] += 1
+                elif ev["ok"][n] is None:
+                    cnt[1] += 1
         lv = levels_fn(feats[s])
         vals = ev["vals"]
         pe = vals["pe"]
@@ -459,17 +474,21 @@ def screen(feats: dict[str, dict], names: dict[str, str], industries: dict[str, 
     for i, r in enumerate(rows, 1):
         r["rank"] = i
 
-    shown = {r["symbol"] for r in rows}
-    misses = [r for r in scored if r["symbol"] not in shown and len(r["hard_fail"]) <= 2
-              and r["symbol"] not in {x["symbol"] for x in shortlist}]
+    # closest misses: stocks that pass the SIZE filter (or lack data for it) but fail a few others
+    short_syms = {x["symbol"] for x in shortlist}
+    misses = [r for r in scored if 1 not in r["hard_fail"] and r["symbol"] not in short_syms
+              and len(r["hard_fail"]) <= cfg.miss_max_hard_fail]
     misses.sort(key=lambda r: (len(r["hard_fail"]) + len(r["soft_fail"]),
                                len(r["hard_unknown"]), -r["score"]))
     misses = misses[: cfg.misses_n]
 
     labels = filter_labels(cfg)
+    funnel_rows = sorted(([n, labels[n], c[0], c[1]] for n, c in funnel.items() if c[0] or c[1]),
+                         key=lambda x: (-x[2], -x[3]))
     return {
         "stats": stats, "n_candidates": len(cands), "n_with_data": len(cands) - stats["no_data"],
         "rows": rows, "misses": misses,
+        "funnel": {"n_small": n_small, "rows": funnel_rows},
         "filters": [[n, "hard" if n in HARD else "soft" if n in SOFT else "manual", labels[n]]
                     for n in range(1, 23)],
         "short": SHORT,
@@ -502,7 +521,22 @@ def _miss_text(r: dict, short: dict) -> str:
         out.append("fails " + ", ".join(short[n] for n in r["hard_fail"]))
     if r["soft_fail"]:
         out.append("check " + ", ".join(short[n] for n in r["soft_fail"]))
+    if r["hard_unknown"]:
+        out.append("no data for " + ", ".join(short[n] for n in r["hard_unknown"]))
     return "; ".join(out)
+
+
+def _funnel_html(q: dict, limit: int = 12) -> str:
+    fn = q.get("funnel") or {}
+    if not fn.get("n_small") or not fn.get("rows"):
+        return ""
+    rows = "".join(f'<tr><td>{n}. {escape(label)}</td><td class="n">{f}</td><td class="n">{u}</td></tr>'
+                   for n, label, f, u in fn["rows"][:limit])
+    return (f'<div class="meth"><strong>Which filters remove the most stocks.</strong> {fn["n_small"]} stocks passed the '
+            "size filter. For each filter: how many of them fail it, and how many have no data for it (Yahoo gaps). "
+            "A filter with a very high \"no data\" count is a data problem, not a business problem.</div>"
+            '<div class="scroll"><table><tr><th>Filter</th><th class="n">Fail</th><th class="n">No data</th></tr>'
+            f"{rows}</table></div>")
 
 
 def render_html_section(q: dict) -> str:
@@ -546,8 +580,9 @@ def render_html_section(q: dict) -> str:
         items = "".join(
             f"<li>{escape(r['name'])} ({escape(r['symbol'])}) - {escape(_miss_text(r, short))}</li>"
             for r in q["misses"])
-        miss_html = (f'<div class="meth"><strong>Closest misses</strong> (fail at most two hard filters):'
-                     f"<ul>{items}</ul></div>")
+        miss_html = (f'<div class="meth"><strong>Closest misses</strong> (inside your size range, failing at most three '
+                     f"hard filters; worth a manual look):<ul>{items}</ul></div>")
+    miss_html += _funnel_html(q)
     filt = " · ".join(f"{n}. {escape(label)}" for n, _t, label in q["filters"])
     meth = (f'<div class="meth"><strong>The 22 filters.</strong> {filt}. '
             "Shortlist = every automated hard filter passes (up to 2 may lack data) and at most 2 soft checks "
@@ -578,6 +613,14 @@ def render_text_section(q: dict) -> str:
         flags = _flags(dict(r, _short=short))
         if flags:
             out.append(f"      {flags}")
+    if q.get("misses"):
+        out.append("Closest misses (inside size range, fail <= 3 hard filters):")
+        for r in q["misses"]:
+            out.append(f"   {r['symbol']:<12} {_miss_text(dict(r), short)}")
+    fn = q.get("funnel") or {}
+    if fn.get("n_small") and fn.get("rows"):
+        top = ", ".join(f"{label.split(' (')[0]} ({f} fail / {u} no data)" for _n, label, f, u in fn["rows"][:5])
+        out.append(f"Of {fn['n_small']} stocks in the size range, most often failing: {top}")
     out.append("Check manually: promoter pledging, auditor changes, related-party dealings, concall summaries.")
     out.append("")
     return "\n".join(out)

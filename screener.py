@@ -3,15 +3,17 @@
 Daily NSE price-bracket stock screener.
 
 Pipeline
-  1. Load a liquid NSE universe (Nifty Total Market / Nifty 500 constituents).
+  1. Load the NSE universe: every NSE EQ stock (default), or Nifty Total Market / Nifty 500 constituents.
   2. Download ~1 year of daily OHLCV from Yahoo Finance (yfinance).
   3. Compute EMA / RSI / ATR / pivots / Fibonacci levels (pure pandas).
   4. Bucket stocks by last close into 10 price brackets, filter illiquid names,
      rank with a transparent 100-point score (trend, RSI, volume, momentum,
      fundamentals) and keep the top N per bracket.
   5. Derive buy zone, 1-4 week target, 1-3 month target and stop-loss.
-  6. Run the 22-filter quality small-cap screen (quality.py) on liquid, trending names.
-  7. Render an HTML dashboard (docs/index.html) and email it.
+  6. Flag fresh breakouts / volume surges, and rank stocks already listed on earlier days lower
+     (data/pick_history.json) so the lists rotate instead of repeating.
+  7. Run the 22-filter quality small-cap screen (quality.py) on liquid, trending names.
+  8. Render an HTML dashboard (docs/index.html) and email it.
 
 IMPORTANT: at 08:30 IST the market has not opened, so "CMP" is the previous
 session's closing price.  Educational / research use only - not investment advice.
@@ -29,7 +31,7 @@ import ssl
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from html import escape
@@ -70,6 +72,11 @@ UNIVERSE_URLS = {
         "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv",
         "https://niftyindices.com/IndexConstituent/ind_nifty500list.csv",
     ],
+    # Every equity listed on NSE (~2,000+). Used for UNIVERSE=all, on top of the Total Market list.
+    "all": [
+        "https://nsearchives.nseindia.com/content/equities/EQUITY_L.csv",
+        "https://archives.nseindia.com/content/equities/EQUITY_L.csv",
+    ],
 }
 
 # Last-resort fallback so the job never dies if NSE blocks the download and no cache exists.
@@ -89,13 +96,19 @@ class Config:
     min_price: float = 10.0            # drop sub-₹10 stocks
     min_turnover_cr: float = 3.0       # 20-day avg traded value, ₹ crore
     min_bars: int = 120                # need enough history for EMA50 / RSI / ATR
-    fundamentals_pool: int = 20        # per bracket, fetch fundamentals only for the best N technical names
-    universe: str = "total"            # "total" (≈750) or "500"
+    fundamentals_pool: int = 30        # per bracket, fetch fundamentals only for the best N technical names
+    universe: str = "all"              # "all" (every NSE EQ stock), "total" (≈750) or "500"
     history_period: str = "1y"
     chunk: int = 100
+    history_budget_s: int = 600        # stop downloading price history after this; the rest is skipped
     max_stale_days: int = 6            # data older than this => abort
     fundamentals_ttl_days: int = 7
     fundamentals_budget_s: int = 420
+    # variety: stocks that stay on the list day after day are ranked lower, and breakouts get their own section
+    rotation_pts: float = 3.0          # score points deducted per consecutive prior day on the list
+    rotation_max_days: int = 5         # ... up to this many days (max 15 points)
+    fresh_top_n: int = 15
+    pick_history_days: int = 15
     data_dir: Path = Path("data")
     out_dir: Path = Path("docs")
     keep_archive_days: int = 45
@@ -112,9 +125,43 @@ _HEADERS = {
 }
 
 
+def _load_all(cfg: Config) -> pd.DataFrame:
+    """Total Market list first (it carries industries), then every other NSE EQ symbol."""
+    base = load_universe(replace(cfg, universe="total"))
+    cache = cfg.data_dir / "universe_all_extra.csv"
+    extra = None
+    for url in UNIVERSE_URLS["all"]:
+        for attempt in range(2):
+            try:
+                r = requests.get(url, headers=_HEADERS, timeout=30)
+                r.raise_for_status()
+                df = _normalise_universe(pd.read_csv(io.StringIO(r.text)))
+                if len(df) >= 1000:
+                    df.to_csv(cache, index=False)
+                    extra = df
+                    break
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Full NSE list download failed (%s, try %d): %s", url, attempt + 1, exc)
+                time.sleep(2)
+        if extra is not None:
+            break
+    if extra is None and cache.exists():
+        extra = pd.read_csv(cache)
+        log.warning("Using cached full NSE list (%d symbols)", len(extra))
+    if extra is None:
+        log.warning("Full NSE list unavailable - using the %d-symbol Total Market list", len(base))
+        return base
+    extra = extra[~extra["symbol"].isin(set(base["symbol"]))]
+    out = pd.concat([base, extra], ignore_index=True)
+    log.info("Universe: %d symbols (%d Total Market + %d other NSE EQ)", len(out), len(base), len(extra))
+    return out
+
+
 def load_universe(cfg: Config) -> pd.DataFrame:
     """Return DataFrame[symbol, name, industry]. Live -> cache -> seed list."""
     cfg.data_dir.mkdir(parents=True, exist_ok=True)
+    if cfg.universe == "all":
+        return _load_all(cfg)
     cache = cfg.data_dir / f"universe_{cfg.universe}.csv"
     urls = UNIVERSE_URLS.get(cfg.universe, []) + (UNIVERSE_URLS["500"] if cfg.universe != "500" else [])
     for url in urls:
@@ -141,7 +188,7 @@ def load_universe(cfg: Config) -> pd.DataFrame:
 
 def _normalise_universe(raw: pd.DataFrame) -> pd.DataFrame:
     cols = {c.strip().lower(): c for c in raw.columns}
-    sym, name = cols.get("symbol"), cols.get("company name")
+    sym, name = cols.get("symbol"), cols.get("company name") or cols.get("name of company")
     if sym is None:
         raise ValueError(f"Unexpected universe columns: {list(raw.columns)}")
     df = pd.DataFrame(
@@ -168,7 +215,11 @@ def fetch_history(symbols: list[str], cfg: Config) -> dict[str, pd.DataFrame]:
     import yfinance as yf
 
     out: dict[str, pd.DataFrame] = {}
+    deadline = time.time() + cfg.history_budget_s
     for chunk in _chunks(symbols, cfg.chunk):
+        if time.time() > deadline:
+            log.warning("Price-history budget (%ds) used up - skipping the remaining symbols", cfg.history_budget_s)
+            break
         tickers = [f"{s}.NS" for s in chunk]
         raw = None
         for attempt in range(3):
@@ -302,6 +353,8 @@ def compute_features(df: pd.DataFrame, cfg: Config, today: datetime | None = Non
         "ret20": float(c.iloc[-1] / c.iloc[-21] - 1) if len(c) > 21 else 0.0,
         "hi52": float(h.iloc[-252:].max()), "lo20": float(l.iloc[-20:].min()),
         "hi20": float(h.iloc[-20:].max()),
+        # highs BEFORE the last session: a close above these is a fresh breakout
+        "prior_hi20": float(h.iloc[-21:-1].max()), "prior_hi52": float(h.iloc[-253:-1].max()),
         "max_abs_ret60": float(rets.abs().max()) if len(rets.dropna()) else 0.0,
         # pivots
         "S1": 2 * pv - h5, "S2": pv - (h5 - l5), "R1": 2 * pv - l5, "R2": pv + (h5 - l5),
@@ -485,8 +538,68 @@ def rationale(f: dict, fa: dict) -> str:
     return text[0].upper() + text[1:]
 
 
+# --------------------------------------------------------------------------- #
+# Variety: pick history, rotation and fresh signals
+# --------------------------------------------------------------------------- #
+def load_pick_history(cfg: Config) -> dict[str, list[str]]:
+    """{data_date: [symbols shown in the bracket tables]} from earlier runs."""
+    p = cfg.data_dir / "pick_history.json"
+    try:
+        return json.loads(p.read_text()) if p.exists() else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def save_pick_history(cfg: Config, hist: dict[str, list[str]], data_date, symbols: list[str]) -> None:
+    hist = dict(hist)
+    hist[str(data_date)] = sorted(set(symbols))
+    keep = sorted(hist)[-cfg.pick_history_days:]
+    cfg.data_dir.mkdir(parents=True, exist_ok=True)
+    (cfg.data_dir / "pick_history.json").write_text(json.dumps({d: hist[d] for d in keep}))
+
+
+def compute_streaks(hist: dict[str, list[str]], before: str) -> dict[str, int] | None:
+    """Consecutive earlier sessions (most recent first) each symbol was on the list.
+    Returns None when there is no earlier day, so first runs show no New / Day-N badges."""
+    days = sorted((d for d in hist if d < before), reverse=True)
+    if not days:
+        return None
+    alive = set(hist[days[0]])
+    streaks = {s: 1 for s in alive}
+    for d in days[1:]:
+        alive &= set(hist[d])
+        if not alive:
+            break
+        for s in alive:
+            streaks[s] += 1
+    return streaks
+
+
+def rotation_penalty(sym: str, streaks: dict[str, int] | None, cfg: Config) -> float:
+    if not streaks:
+        return 0.0
+    return cfg.rotation_pts * min(streaks.get(sym, 0), cfg.rotation_max_days)
+
+
+def fresh_signal(f: dict) -> tuple[str, int] | None:
+    """Event-type signals that change day to day (unlike EMA position). Returns (label, priority)."""
+    c, e200 = f["close"], f["ema200"]
+    if not (c > f["ema50"] and not math.isnan(e200) and c > e200):
+        return None
+    if f["rsi"] > 80:                      # already stretched
+        return None
+    vr = f["vol_ratio"]
+    if c > f["prior_hi52"] and vr >= 1.2:
+        return "New 52-week high", 3
+    if c > f["prior_hi20"] and vr >= 1.5:
+        return "20-day breakout on volume", 2
+    if vr >= 2.5 and f["chg_pct"] >= 2.0:
+        return "Volume surge (+2% or more)", 1
+    return None
+
+
 def build_bracket(feats: dict[str, dict], names: dict[str, str], cfg: Config,
-                  fundamentals_fn) -> list[dict]:
+                  fundamentals_fn, streaks: dict[str, int] | None = None) -> list[dict]:
     """Rank one bracket's eligible stocks and return the final rows."""
     cand = []
     for sym, f in feats.items():
@@ -497,8 +610,9 @@ def build_bracket(feats: dict[str, dict], names: dict[str, str], cfg: Config,
             continue
         ts = technical_score(f)
         cand.append({"sym": sym, "f": f, "ts": ts, "crit": crit,
-                     "strict_tech": all(crit.values())})
-    cand.sort(key=lambda x: (x["strict_tech"], x["ts"]["total"]), reverse=True)
+                     "strict_tech": all(crit.values()),
+                     "pen": rotation_penalty(sym, streaks, cfg)})
+    cand.sort(key=lambda x: (x["strict_tech"], x["ts"]["total"] - x["pen"]), reverse=True)
     pool = cand[: cfg.fundamentals_pool]
 
     funds = fundamentals_fn([p["sym"] for p in pool])
@@ -514,11 +628,13 @@ def build_bracket(feats: dict[str, dict], names: dict[str, str], cfg: Config,
         rows.append({
             "symbol": p["sym"], "name": names.get(p["sym"], p["sym"]),
             "cmp": p["f"]["close"], "chg_pct": p["f"]["chg_pct"],
-            "score": round(total, 1), "strict": strict, "missed": missed,
+            "score": round(total, 1), "rank_score": round(total - p["pen"], 1),
+            "streak": None if streaks is None else streaks.get(p["sym"], 0),
+            "strict": strict, "missed": missed,
             "rationale": rationale(p["f"], fa), "fund_known": fa["known"],
             **lv,
         })
-    rows.sort(key=lambda r: (r["strict"], r["score"]), reverse=True)
+    rows.sort(key=lambda r: (r["strict"], r["rank_score"]), reverse=True)
     rows = rows[: cfg.top_n]
     for i, r in enumerate(rows, 1):
         r["rank"] = i
@@ -526,8 +642,10 @@ def build_bracket(feats: dict[str, dict], names: dict[str, str], cfg: Config,
 
 
 def run_screen(histories: dict[str, pd.DataFrame], names: dict[str, str], cfg: Config,
-               fundamentals_fn, today: datetime | None = None) -> dict:
+               fundamentals_fn, today: datetime | None = None,
+               streaks: dict[str, int] | None = None) -> dict:
     by_bracket: dict[str, dict[str, dict]] = {b[2]: {} for b in BRACKETS}
+    fresh: list[dict] = []
     stats = {"universe": len(histories), "no_features": 0, "illiquid": 0, "anomaly": 0,
              "out_of_range": 0, "eligible": 0}
     latest = None
@@ -554,15 +672,28 @@ def run_screen(histories: dict[str, pd.DataFrame], names: dict[str, str], cfg: C
             stats["out_of_range"] += 1
             continue
         stats["eligible"] += 1
+        sig = fresh_signal(f)
+        if sig:
+            # Breakout levels measured from CMP (the pullback-based buy zone used in the tables is not
+            # meaningful for a stock already breaking out): stop 1.5 ATR below, target 3 ATR above (2:1).
+            c0, a0 = f["close"], f["atr"]
+            sl = max(c0 - 1.5 * a0, c0 * 0.90, 0.05)
+            st = c0 + 3.0 * a0
+            fresh.append({"symbol": sym, "name": names.get(sym, sym), "cmp": c0,
+                          "chg_pct": f["chg_pct"], "vol_ratio": f["vol_ratio"], "rsi": f["rsi"],
+                          "signal": sig[0], "prio": sig[1], "sl": tick(sl), "sl_pct": (sl / c0 - 1) * 100,
+                          "st": tick(st), "st_pct": (st / c0 - 1) * 100})
 
     brackets = []
     for lo, hi, label in BRACKETS:
         feats = by_bracket[label]
-        rows = build_bracket(feats, names, cfg, fundamentals_fn) if feats else []
+        rows = build_bracket(feats, names, cfg, fundamentals_fn, streaks) if feats else []
         brackets.append({"label": label, "lo": lo, "hi": hi, "eligible": len(feats), "rows": rows})
         log.info("%-14s eligible=%3d picked=%2d (full match=%d)", label, len(feats), len(rows),
                  sum(r["strict"] for r in rows))
-    return {"data_date": latest, "stats": stats, "brackets": brackets}
+    fresh.sort(key=lambda r: (r["prio"], r["vol_ratio"]), reverse=True)
+    stats["fresh_total"] = len(fresh)
+    return {"data_date": latest, "stats": stats, "brackets": brackets, "fresh": fresh[: cfg.fresh_top_n]}
 
 
 # --------------------------------------------------------------------------- #
@@ -595,6 +726,7 @@ td.n,th.n{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
 .sm{color:#6b7587;font-size:11px}.up{color:#1b7a3a}.dn{color:#b3261e}
 .b{display:inline-block;padding:0 6px;border-radius:9px;font-size:10px;margin-left:4px}
 .bf{background:#e3f4e8;color:#1b6b34}.bp{background:#fdf0d5;color:#8a5a00}
+.bn{background:#dcecff;color:#0b4a8f}.bs{background:#eceff3;color:#5b6576}
 .rat{color:#3b4658;min-width:230px}
 .foot{margin-top:28px;padding:12px 14px;background:#fff;border:1px solid #dfe3ea;border-radius:8px;font-size:12px;color:#4a5466}
 .meth{font-size:12px;color:#5b6576;margin-top:14px}
@@ -608,6 +740,55 @@ def _inr(x: float) -> str:
 
 def _pct(x: float) -> str:
     return f"{x:+.1f}%"
+
+
+def changes_banner(report: dict) -> str:
+    rows = [r for b in report["brackets"] for r in b["rows"]]
+    if not rows or all(r.get("streak") is None for r in rows):
+        return ""                                   # first run: nothing to compare with
+    new = sum(1 for r in rows if r.get("streak") == 0)
+    return (f'<div class="banner">Price-bracket lists today: {len(rows)} picks, <strong>{new} new</strong> since the '
+            f"previous session and {len(rows) - new} carried over. Stocks that stay on the list are ranked lower the longer "
+            'they stay (see the "Day N" tags), so new names can come in.</div>')
+
+
+def render_fresh_html(rows: list[dict] | None, stats: dict) -> str:
+    head = ('<h2 id="fresh">Fresh signals today <span class="sm">· breakouts and volume surges - events that change '
+            "day to day</span></h2>")
+    if not rows:
+        return head + ('<div class="banner">No breakout or volume-surge signals today among liquid stocks above their '
+                       "50 &amp; 200 EMA.</div>")
+    body = []
+    for i, r in enumerate(rows, 1):
+        url = f"https://www.screener.in/company/{quote(r['symbol'])}/"
+        cls = "up" if r["chg_pct"] >= 0 else "dn"
+        body.append(
+            f'<tr><td class="n">{i}</td><td class="nm"><a href="{url}">{escape(r["name"])}</a>'
+            f'<div class="tk">NSE: {escape(r["symbol"])}</div></td>'
+            f'<td class="n">{_inr(r["cmp"])}</td><td class="n {cls}">{_pct(r["chg_pct"])}</td>'
+            f'<td class="n">{r["vol_ratio"]:.1f}×</td><td class="n">{r["rsi"]:.0f}</td>'
+            f'<td>{escape(r["signal"])}</td>'
+            f'<td class="n dn">{_inr(r["sl"])}<div class="sm">{_pct(r["sl_pct"])}</div></td>'
+            f'<td class="n up">{_inr(r["st"])}<div class="sm">{_pct(r["st_pct"])}</div></td></tr>')
+    total = stats.get("fresh_total", len(rows))
+    note = (f'<div class="meth">Showing the {len(rows)} strongest of {total} signals. Only liquid stocks priced up to ₹1,000 '
+            "that are above both their 50 &amp; 200 EMA with RSI ≤ 80. Breakouts can reverse quickly: consider waiting for a "
+            "pullback towards the breakout level and size positions small. Stop-loss = 1.5 × ATR below CMP (max 10%), target = "
+            "3 × ATR above CMP (2:1 reward-to-risk). Mechanical estimates, not forecasts.</div>")
+    return (head + '<div class="scroll"><table><tr><th class="n">#</th><th>Stock</th><th class="n">CMP</th>'
+            '<th class="n">Day</th><th class="n">Volume</th><th class="n">RSI</th><th>Signal</th>'
+            '<th class="n">Stop-loss</th><th class="n">Target 1–4 wk</th></tr>' + "".join(body) + "</table></div>" + note)
+
+
+def render_fresh_text(rows: list[dict] | None) -> str:
+    out = ["== Fresh signals today (breakouts / volume surges) =="]
+    if not rows:
+        out.append("None today.")
+    for i, r in enumerate(rows or [], 1):
+        out.append(f"{i:>2}. {r['symbol']:<12} CMP {r['cmp']:.2f} ({r['chg_pct']:+.1f}%) | vol {r['vol_ratio']:.1f}x"
+                   f" | {r['signal']} | SL {r['sl']:.2f} | T1 {r['st']:.2f}")
+    out.append("")
+    return "\n".join(out)
 
 
 def render_html(report: dict, cfg: Config, web: bool = True) -> str:
@@ -629,12 +810,13 @@ def render_html(report: dict, cfg: Config, web: bool = True) -> str:
 
     nav = ""
     if web:
-        nav = '<div class="nav">' + "".join(
-            f'<a href="#b{i}">{escape(b["label"])}</a>' for i, b in enumerate(report["brackets"]))
+        nav = '<div class="nav">' + ('<a href="#fresh">Fresh signals</a>' if "fresh" in report else "")
         if report.get("quality"):
             nav += '<a href="#quality">Quality shortlist</a>'
+        nav += "".join(f'<a href="#b{i}">{escape(b["label"])}</a>' for i, b in enumerate(report["brackets"]))
         nav += "</div>"
     quality_html = quality.render_html_section(report["quality"]) if report.get("quality") else ""
+    fresh_html = render_fresh_html(report.get("fresh"), st) if "fresh" in report else ""
 
     sections = []
     for i, b in enumerate(report["brackets"]):
@@ -649,6 +831,10 @@ def render_html(report: dict, cfg: Config, web: bool = True) -> str:
             badge = ('<span class="b bf">Full match</span>' if r["strict"] else
                      f'<span class="b bp" title="{escape(", ".join(r["missed"]))}">Partial</span>')
             miss = "" if r["strict"] else f'<div class="sm">Missed: {escape(", ".join(r["missed"]))}</div>'
+            sk = r.get("streak")
+            if sk is not None:
+                badge += ('<span class="b bn">New</span>' if sk == 0
+                          else f'<span class="b bs">Day {sk + 1}</span>')
             url = f"https://www.screener.in/company/{quote(r['symbol'])}/"
             chg_cls = "up" if r["chg_pct"] >= 0 else "dn"
             rows_html.append(
@@ -679,7 +865,9 @@ def render_html(report: dict, cfg: Config, web: bool = True) -> str:
         "(or carry a fundamental red flag). Stocks below their 50- or 200-EMA are never listed. Buy zone = nearest support "
         "(5-day pivot S1, 20/50 EMA, Fibonacci 38.2/50%, 20-day low) within 1.5×ATR of CMP. "
         "Stop = buy-zone low − 1×ATR (max 10% risk). Targets use pivot R1/R2, 60-day swing high and Fibonacci "
-        "extensions, falling back to ATR multiples. R:R is computed to the 1–4 week target from the mid-point of the buy zone."
+        "extensions, falling back to ATR multiples. R:R is computed to the 1–4 week target from the mid-point of the buy zone. "
+        f"To keep the lists fresh, each consecutive day a stock has already been listed deducts {cfg.rotation_pts:g} score "
+        f"points (up to {cfg.rotation_max_days} days) from its ranking score; the score shown is the raw score."
         "</div>")
 
     stats_line = (f"{st['universe']} symbols downloaded · {st['eligible']} passed liquidity/price filters "
@@ -692,7 +880,7 @@ def render_html(report: dict, cfg: Config, web: bool = True) -> str:
         f"<h1>NSE Daily Price-Bracket Screener</h1>"
         f'<div class="sub">Based on closing prices of <strong>{d}</strong> (last completed session) · '
         f"generated {gen} · CMP = last close, not a live quote</div>"
-        f"{market}{nav}{quality_html}{''.join(sections)}{method}"
+        f"{market}{nav}{changes_banner(report)}{fresh_html}{quality_html}{''.join(sections)}{method}"
         f'<div class="sm" style="margin-top:8px">{stats_line}</div>'
         f'<div class="foot">{DISCLAIMER}</div></div></body></html>'
     )
@@ -701,6 +889,8 @@ def render_html(report: dict, cfg: Config, web: bool = True) -> str:
 def render_text(report: dict) -> str:
     out = [f"NSE Daily Price-Bracket Screener - data as of {report['data_date']}",
            "(Open the attached HTML for the full tables.)", ""]
+    if "fresh" in report:
+        out.append(render_fresh_text(report["fresh"]))
     if report.get("quality"):
         out.append(quality.render_text_section(report["quality"]))
     for b in report["brackets"]:
@@ -779,7 +969,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--force", action="store_true", help="run even if no new trading session since last run")
     ap.add_argument("--no-quality", action="store_true", help="skip the 22-filter quality small-cap screen")
     ap.add_argument("--limit", type=int, default=0, help="debug: only screen the first N symbols")
-    ap.add_argument("--universe", choices=["total", "500"], default=os.environ.get("UNIVERSE", "total"))
+    ap.add_argument("--universe", choices=["all", "total", "500"], default=os.environ.get("UNIVERSE", "all"),
+                    help="all = every NSE EQ stock (default), total = Nifty Total Market (~750), 500 = Nifty 500")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
@@ -814,7 +1005,9 @@ def main(argv: list[str] | None = None) -> int:
         log.info("No new trading session since %s (market holiday?) - skipping", last)
         return 0
 
-    report = run_screen(hist, names, cfg, lambda syms: fetch_fundamentals(syms, cfg), now)
+    picks_hist = load_pick_history(cfg)
+    streaks = compute_streaks(picks_hist, str(newest.date()))
+    report = run_screen(hist, names, cfg, lambda syms: fetch_fundamentals(syms, cfg), now, streaks)
     report["market"] = market_context(cfg)
     run_quality = not args.no_quality and os.environ.get("QUALITY_SCREEN", "1").lower() not in ("0", "false", "no")
     if run_quality and quality is None:
@@ -840,6 +1033,8 @@ def main(argv: list[str] | None = None) -> int:
     html = render_html(report, cfg, web=True)
     write_outputs(report, html, cfg)
     state_path.write_text(json.dumps({"data_date": str(report["data_date"])}))
+    save_pick_history(cfg, picks_hist, report["data_date"],
+                      [r["symbol"] for b in report["brackets"] for r in b["rows"]])
     log.info("Report written to %s", cfg.out_dir / "index.html")
 
     if args.no_email:
