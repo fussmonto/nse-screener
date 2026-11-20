@@ -13,10 +13,28 @@ Stock name + NSE ticker · CMP · buy zone · target 1–4 weeks · target 1–3
 
 **CMP = previous session's close.** The job runs before the 9:15 AM open, so no live price exists yet.
 
+## Keeping the lists fresh (no more same stocks every day)
+The bracket tables rank on trend indicators that change slowly, so left alone the same leaders would sit on top for weeks.
+Three things now prevent that:
+
+* **Whole market, not just 750 stocks.** `UNIVERSE=all` (the default) screens every NSE EQ-series stock: the Nifty Total Market
+  list first, then all other NSE equities. If the full list can't be downloaded it falls back to the cached copy, then to the
+  Total Market list. Price history download stops after 10 minutes (`history_budget_s`) so the job always finishes; whatever is
+  skipped is at the end of the list. Use `UNIVERSE=total` for the old smaller list.
+* **Rotation.** The job remembers which stocks were listed on earlier days (`data/pick_history.json`, last 15 sessions). Each
+  consecutive day a stock has already been listed deducts 3 points from its ranking score (max 5 days = 15 points), so repeats drop
+  and new names enter. Tags show **New** or **Day N**, and a banner says how many picks are new. The score shown stays the raw score.
+* **Fresh signals section.** Events, not positions: a close above the prior 52-week high on volume ≥ 1.2× average, a close above the
+  prior 20-day high on volume ≥ 1.5×, or a ≥ 2% jump on volume ≥ 2.5×, only for liquid stocks above their 50 & 200 EMA with RSI ≤ 80
+  and a price up to ₹1,000. Stop = 1.5 × ATR below CMP, target = 3 × ATR above (2:1). Top 15 by signal strength and volume.
+
+Rotation and signals are about **variety and timing, not about predicting winners**. A stock being new on the list says nothing about
+whether it will rise.
+
 ## Screening logic
 | Step | Rule |
 |---|---|
-| Universe | Nifty Total Market (~750) list from NSE → fallback Nifty 500 → cached copy → built-in seed list |
+| Universe | Every NSE EQ stock (Nifty Total Market first) → fallback cached full list → Nifty Total Market (~750) → Nifty 500 → cached copy → built-in seed list |
 | Liquidity / penny filter | Price ≥ ₹10, 20-day average traded value ≥ ₹3 crore, ≤ 2 zero-volume days in last 20 |
 | Data-quality filter | Skip stocks with a >30% one-day move in the last 60 sessions (usually unadjusted splits / bad ticks) |
 | Hard trend gate | Close above **both** 50-EMA and 200-EMA (never recommends downtrends) |
@@ -73,7 +91,11 @@ reviewed roughly once a year) - not for short-term trading. It has no price cap:
 * A stock that *fails* a hard filter is never shortlisted; missing data is shown as "No data", never silently treated as a pass.
 * Banks, NBFCs and insurers are excluded (ROCE, debt/equity and interest cover mean something different for lenders).
 * Ranked by a transparent quality score (ROCE 35, sales growth 25, profit growth 25, cheapness 15); **max 2 stocks per sector**.
-  Top 15 are shown, plus the 10 closest misses.
+  Top 15 are shown. If nothing passes, the report lists the **closest misses** (stocks inside the size range that fail at most
+  three hard filters) and a **filter table** showing how many stocks fail each filter and how many have no data for it, so you can
+  see which thresholds are too strict or which Yahoo fields are missing before changing anything.
+* Stocks trading over ₹250 crore a day are skipped (large caps cannot pass the market-cap filter) and fundamentals are fetched first
+  for stocks with typical small-cap turnover.
 * Buy zone and stop-loss reuse the same ATR / pivot / Fibonacci logic as the bracket screen, as an entry guide only.
 * Thresholds are all in the `QualityConfig` dataclass at the top of `quality.py`. Turn the screen off with
   `QUALITY_SCREEN=0` or `python screener.py --no-quality`. If it fails for any reason the main report and email still go out.
@@ -119,7 +141,7 @@ python screener.py --no-email       # real run; writes docs/index.html
 python screener.py --limit 60 -v    # quick debug run on 60 symbols
 python screener.py --no-quality     # skip the 22-filter quality shortlist
 ```
-Tuning (environment variables): `UNIVERSE=500`, `MIN_TURNOVER_CR=5`, `MIN_PRICE=20`, `QUALITY_SCREEN=0`. Everything else is in the `Config` dataclass at the top of `screener.py`.
+Tuning (environment variables): `UNIVERSE=all|total|500`, `MIN_TURNOVER_CR=5`, `MIN_PRICE=20`, `QUALITY_SCREEN=0`. Everything else is in the `Config` dataclass at the top of `screener.py`.
 
 ## Known limitations
 * Yahoo Finance via `yfinance` is unofficial: it can rate-limit shared GitHub IPs, change formats, or serve occasional bad data. If a run fails, re-run it; if it keeps failing, upgrade `yfinance`.
