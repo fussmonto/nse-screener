@@ -1,0 +1,11 @@
+{
+  "name": "NSE Trading Desk",
+  "short_name": "NSE Desk",
+  "description": "Daily NSE screener, intraday and CNC desk, quality shortlist and your watchlist.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#070b14",
+  "theme_color": "#070b14",
+  "icons": [{"src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any"}]
+}

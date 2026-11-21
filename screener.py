@@ -13,7 +13,9 @@ Pipeline
   6. Flag fresh breakouts / volume surges, and rank stocks already listed on earlier days lower
      (data/pick_history.json) so the lists rotate instead of repeating.
   7. Run the 22-filter quality small-cap screen (quality.py) on liquid, trending names.
-  8. Render an HTML dashboard (docs/index.html) and email it.
+  8. Analyse your own watchlist and fetch market headlines (radar.py, the former Indian Stock Radar).
+  9. Write docs/latest.json (the data behind the website, docs/index.html), render the classic report
+     (docs/report.html + archive) and email it.
 
 IMPORTANT: at 08:30 IST the market has not opened, so "CMP" is the previous
 session's closing price.  Educational / research use only - not investment advice.
@@ -56,6 +58,11 @@ try:  # intraday watchlist, CNC shortlist, market pulse, news flags, position si
     import desk
 except ImportError:  # pragma: no cover
     desk = None
+
+try:  # your watchlist + market headlines (radar.py, the former Indian Stock Radar). Optional too.
+    import radar
+except ImportError:  # pragma: no cover
+    radar = None
 
 log = logging.getLogger("screener")
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -826,11 +833,14 @@ def render_html(report: dict, cfg: Config, web: bool = True) -> str:
         nav += ('<a href="#fresh">Fresh signals</a>' if "fresh" in report else "")
         if report.get("quality"):
             nav += '<a href="#quality">Quality shortlist</a>'
+        if report.get("radar") and report["radar"].get("watchlist"):
+            nav += '<a href="#watchlist">My watchlist</a>'
         nav += "".join(f'<a href="#b{i}">{escape(b["label"])}</a>' for i, b in enumerate(report["brackets"]))
         nav += "</div>"
     quality_html = quality.render_html_section(report["quality"]) if report.get("quality") else ""
     fresh_html = render_fresh_html(report.get("fresh"), st) if "fresh" in report else ""
     desk_html = desk.render_html(report["desk"]) if (desk and report.get("desk")) else ""
+    radar_html = radar.render_html_section(report["radar"]) if (radar and report.get("radar")) else ""
 
     sections = []
     for i, b in enumerate(report["brackets"]):
@@ -894,7 +904,7 @@ def render_html(report: dict, cfg: Config, web: bool = True) -> str:
         f"<h1>NSE Daily Trading Desk</h1>"
         f'<div class="sub">Based on closing prices of <strong>{d}</strong> (last completed session) · '
         f"generated {gen} · CMP = last close, not a live quote</div>"
-        f"{market}{nav}{desk_html}{changes_banner(report)}{fresh_html}{quality_html}{''.join(sections)}{method}"
+        f"{market}{nav}{desk_html}{radar_html}{changes_banner(report)}{fresh_html}{quality_html}{''.join(sections)}{method}"
         f'<div class="sm" style="margin-top:8px">{stats_line}</div>'
         f'<div class="foot">{DISCLAIMER}</div></div></body></html>'
     )
@@ -905,6 +915,8 @@ def render_text(report: dict) -> str:
            "(Open the attached HTML for the full tables.)", ""]
     if desk and report.get("desk"):
         out.append(desk.render_text(report["desk"]))
+    if radar and report.get("radar") and report["radar"].get("watchlist"):
+        out.append(radar.render_text_section(report["radar"]))
     if "fresh" in report:
         out.append(render_fresh_text(report["fresh"]))
     if report.get("quality"):
@@ -926,7 +938,9 @@ def write_outputs(report: dict, html: str, cfg: Config) -> None:
     cfg.out_dir.mkdir(parents=True, exist_ok=True)
     arch = cfg.out_dir / "archive"
     arch.mkdir(exist_ok=True)
-    (cfg.out_dir / "index.html").write_text(html, encoding="utf-8")
+    # docs/index.html is the hand-written website (it reads latest.json) and is never touched here;
+    # the classic one-page report lives next to it as report.html and in the dated archive.
+    (cfg.out_dir / "report.html").write_text(html, encoding="utf-8")
     (arch / f"{report['data_date']}.html").write_text(html, encoding="utf-8")
     slim = {**report, "data_date": str(report["data_date"])}
     (cfg.out_dir / "latest.json").write_text(json.dumps(slim, indent=1, default=str), encoding="utf-8")
@@ -942,7 +956,8 @@ def write_outputs(report: dict, html: str, cfg: Config) -> None:
     links = "".join(f'<li><a href="{s}.html">{s}</a></li>' for s in idx)
     (arch / "index.html").write_text(
         f'<!doctype html><meta charset="utf-8"><title>Archive</title><h1>Report archive</h1><ul>{links}</ul>'
-        '<p><a href="../index.html">Latest report</a></p>', encoding="utf-8")
+        '<p><a href="../index.html">Dashboard</a> · <a href="../report.html">Latest classic report</a></p>',
+        encoding="utf-8")
 
 
 def send_email(report: dict, html: str) -> None:
@@ -985,6 +1000,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--force", action="store_true", help="run even if no new trading session since last run")
     ap.add_argument("--no-quality", action="store_true", help="skip the 22-filter quality small-cap screen")
     ap.add_argument("--no-desk", action="store_true", help="skip the intraday watchlist, CNC shortlist and market pulse")
+    ap.add_argument("--no-radar", action="store_true", help="skip your watchlist analysis and the market headlines")
     ap.add_argument("--limit", type=int, default=0, help="debug: only screen the first N symbols")
     ap.add_argument("--universe", choices=["all", "total", "500"], default=os.environ.get("UNIVERSE", "all"),
                     help="all = every NSE EQ stock (default), total = Nifty Total Market (~750), 500 = Nifty 500")
@@ -1060,13 +1076,27 @@ def main(argv: list[str] | None = None) -> int:
                      dk["events_found"])
         except Exception as exc:  # noqa: BLE001
             log.error("Trading desk failed (report continues without it): %s", exc)
+    run_radar = not args.no_radar and os.environ.get("RADAR", "1").lower() not in ("0", "false", "no")
+    if run_radar and radar is None:
+        log.error("radar.py not found next to screener.py - skipping the watchlist and market headlines")
+        run_radar = False
+    if run_radar:
+        try:   # optional too: a broken watchlist or news feed must never stop the report or the email
+            qcfg_r = quality.QualityConfig(data_dir=cfg.data_dir) if quality else None
+            report["radar"] = radar.build_radar(
+                hist, dict(zip(uni["symbol"], uni["industry"].fillna("").astype(str))), now=now,
+                compute_features=lambda df: compute_features(df, cfg, now), compute_levels=compute_levels,
+                fetch_missing=lambda syms: fetch_history(syms, cfg),
+                fetch_metrics=(lambda syms: quality.fetch_metrics(syms, qcfg_r)) if qcfg_r else None)
+        except Exception as exc:  # noqa: BLE001
+            log.error("Radar (watchlist / headlines) failed (report continues without it): %s", exc)
     report["generated_at"] = now.strftime("%d %b %Y, %H:%M IST")
     html = render_html(report, cfg, web=True)
     write_outputs(report, html, cfg)
     state_path.write_text(json.dumps({"data_date": str(report["data_date"])}))
     save_pick_history(cfg, picks_hist, report["data_date"],
                       [r["symbol"] for b in report["brackets"] for r in b["rows"]])
-    log.info("Report written to %s", cfg.out_dir / "index.html")
+    log.info("Report written to %s (+ %s for the website)", cfg.out_dir / "report.html", cfg.out_dir / "latest.json")
 
     if args.no_email:
         return 0

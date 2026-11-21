@@ -21,6 +21,9 @@ import desk as D  # noqa: E402
 D._real_fetch_events = D.fetch_events      # desk tests exercise the real one
 D.fetch_pulse = lambda: []
 D.fetch_events = lambda syms, ref, dc, now_utc=None: {}
+import radar as R  # noqa: E402  (watchlist + headlines; headlines would hit the network)
+R._real_fetch_news = R.fetch_news           # test_radar.py exercises the real one
+R.fetch_news = lambda *a, **k: []
 
 NOW = datetime(2026, 11, 13, 8, 30, tzinfo=S.IST)
 DATES = pd.bdate_range(end="2026-11-12", periods=260)
@@ -166,7 +169,7 @@ def test_render_and_outputs(rep):
     with tempfile.TemporaryDirectory() as d:
         cfg.out_dir = Path(d) / "docs"
         S.write_outputs(rep, web, cfg)
-        assert (cfg.out_dir / "index.html").exists() and (cfg.out_dir / "latest.json").exists()
+        assert (cfg.out_dir / "report.html").exists() and (cfg.out_dir / "latest.json").exists()
         assert (cfg.out_dir / "archive" / f"{rep['data_date']}.html").exists()
         assert (cfg.out_dir / "archive" / "index.html").exists()
     print("ok  outputs")
@@ -251,7 +254,7 @@ def test_main_end_to_end():
                  mock.patch.object(Q, "fetch_metrics", lambda syms, qcfg: {}), \
                  mock.patch.object(S, "datetime", FakeDT):
                 assert S.main(["--no-email"]) == 0
-                p = Path("docs/index.html")
+                p = Path("docs/report.html")
                 assert p.exists() and "2026-11-12" in p.read_text()
                 m1 = p.stat().st_mtime_ns
                 assert S.main(["--no-email"]) == 0                      # same session => skipped
@@ -503,7 +506,7 @@ def test_main_with_quality():
                 assert S.main(["--force"]) == 0
                 rep = json.loads(Path("docs/latest.json").read_text())
                 assert rep["quality"]["rows"], "quality section must be in latest.json"
-                assert 'id="quality"' in Path("docs/index.html").read_text()
+                assert 'id="quality"' in Path("docs/report.html").read_text()
                 body = sent["msg"].get_body(preferencelist=("plain",)).get_content()
                 assert "Quality small-cap shortlist" in body
                 # --no-quality skips it
@@ -734,7 +737,7 @@ def test_main_variety():
                 assert S.main(["--no-email", "--no-quality"]) == 0
                 day1 = json.loads(Path("data/pick_history.json").read_text())
                 assert list(day1) == ["2026-11-12"] and len(day1["2026-11-12"]) > 20
-                html1 = Path("docs/index.html").read_text()
+                html1 = Path("docs/report.html").read_text()
                 assert "Day 2" not in html1 and 'class="b bn"' not in html1, "first run: nothing to compare with"
                 assert "BRK" in html1 and 'id="fresh"' in html1
                 # pretend those picks were also listed the previous session, minus a few that become "New"
@@ -742,7 +745,7 @@ def test_main_variety():
                 prev = {"2026-11-11": listed[3:]}
                 Path("data/pick_history.json").write_text(json.dumps(prev))
                 assert S.main(["--no-email", "--no-quality", "--force"]) == 0
-                html2 = Path("docs/index.html").read_text()
+                html2 = Path("docs/report.html").read_text()
                 assert "Day 2" in html2 and 'class="b bn">New' in html2 and "new</strong> since the previous session" in html2
                 rep = json.loads(Path("docs/latest.json").read_text())
                 streaks = [r["streak"] for b in rep["brackets"] for r in b["rows"]]

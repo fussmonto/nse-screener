@@ -34,6 +34,7 @@ jobs:
           python tests/test_offline.py
           python tests/test_desk.py
           python tests/test_telegram.py
+          python tests/test_radar.py
 
       - name: Run screener and send email
         env:
@@ -44,6 +45,8 @@ jobs:
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          # Optional: a published Google Sheet CSV (columns Symbol, Name, Sector, Mode, My_Buy_Price) replaces watchlist.json
+          GOOGLE_SHEET_CSV_URL: ${{ secrets.GOOGLE_SHEET_CSV_URL }}
           PAGES_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
           # Manual runs always regenerate, even if no new trading day exists
           FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' }}

@@ -1,0 +1,12 @@
+[
+  {"symbol": "SUZLON", "name": "Suzlon Energy Ltd", "sector": "Renewable Energy", "mode": "CNC"},
+  {"symbol": "NHPC", "name": "NHPC Ltd", "sector": "Power / PSU", "mode": "CNC"},
+  {"symbol": "SJVN", "name": "SJVN Ltd", "sector": "Power / PSU", "mode": "CNC"},
+  {"symbol": "MAHABANK", "name": "Bank of Maharashtra", "sector": "PSU Banking", "mode": "INTRADAY"},
+  {"symbol": "IRB", "name": "IRB Infrastructure Dev", "sector": "Infrastructure", "mode": "CNC"},
+  {"symbol": "YESBANK", "name": "Yes Bank Ltd", "sector": "Private Banking", "mode": "INTRADAY"},
+  {"symbol": "HDFCBANK", "name": "HDFC Bank Ltd", "sector": "Private Banking", "mode": "INTRADAY"},
+  {"symbol": "RELIANCE", "name": "Reliance Industries Ltd", "sector": "Energy & Telecom", "mode": "CNC"},
+  {"symbol": "JPPOWER", "name": "Jaiprakash Power Ventures", "sector": "Power", "mode": "CNC"},
+  {"symbol": "CUPID", "name": "Cupid Ltd", "sector": "Healthcare", "mode": "CNC"}
+]

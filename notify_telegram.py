@@ -85,6 +85,14 @@ def build_messages(report: dict, pages_url: str = "") -> list[str]:
                          f" · R:R {r['rr']:.1f}" + (f" · qty {q:,}" if q else "") + _ev(r.get("event")))
         if d["cnc"]["skipped"]:
             lines.append("Held back (results soon): " + escape(", ".join(d["cnc"]["skipped"])))
+    watch = (report.get("radar") or {}).get("watchlist") or []
+    if watch:
+        lines.append("\n<b>👀 MY WATCHLIST</b>")
+        for r in watch[:8]:
+            lines.append(f"<b>{escape(r['symbol'])}</b> · CMP {_p(r['cmp'])} ({_pc(r['chg_pct'])}) · "
+                         f"<i>{'In buy zone' if r['in_zone'] else 'Wait for pullback'}</i>\n"
+                         f"  Buy {_p(r['buy_low'])}-{_p(r['buy_high'])} · SL {_p(r['sl'])} · "
+                         f"T1 {_p(r['t1'])} · T2 {_p(r['t2'])}")
     fresh = report.get("fresh") or []
     if fresh:
         lines.append("\n<b>🚀 FRESH BREAKOUTS (top 5)</b>")

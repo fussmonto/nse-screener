@@ -244,7 +244,7 @@ def test_main_integration():
                  mock.patch.object(T.Q, "fetch_metrics", lambda syms, qcfg: {}), \
                  mock.patch.object(S, "datetime", FakeDT):
                 assert S.main(["--no-email"]) == 0
-                html = Path("docs/index.html").read_text()
+                html = Path("docs/report.html").read_text()
                 assert "NSE Daily Trading Desk" in html and "Intraday (MIS) watchlist" in html
                 assert 'href="#intraday"' in html and "CNC delivery shortlist" in html
                 latest = json.loads(Path("docs/latest.json").read_text())
@@ -254,7 +254,7 @@ def test_main_integration():
 
                 # --no-desk and the TRADING_DESK switch
                 assert S.main(["--no-email", "--force", "--no-desk"]) == 0
-                assert "Intraday (MIS) watchlist" not in Path("docs/index.html").read_text()
+                assert "Intraday (MIS) watchlist" not in Path("docs/report.html").read_text()
                 with mock.patch.dict(os.environ, {"TRADING_DESK": "0"}):
                     assert S.main(["--no-email", "--force"]) == 0
                     assert "desk" not in json.loads(Path("docs/latest.json").read_text())
@@ -262,7 +262,7 @@ def test_main_integration():
                 # a crash inside the desk must not stop the report or the email
                 with mock.patch.object(D, "build_desk", side_effect=RuntimeError("yahoo down")):
                     assert S.main(["--no-email", "--force"]) == 0
-                    h2 = Path("docs/index.html").read_text()
+                    h2 = Path("docs/report.html").read_text()
                     assert "Intraday (MIS) watchlist" not in h2 and "₹" in h2           # bracket tables still there
 
                 # email carries the new subject and the desk text

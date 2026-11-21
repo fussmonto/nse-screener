@@ -3,10 +3,48 @@
 Every weekday morning this project downloads NSE price history, screens liquid stocks, picks the
 **Top 10 in each of 10 price brackets** (Below ₹100 … ₹901–1,000), and
 
-* emails you an HTML report (full copy attached), and
-* publishes the same report as a web dashboard on GitHub Pages (`docs/index.html`, 45-day archive).
+* emails you an HTML report (full copy attached),
+* sends a Telegram summary (optional), and
+* publishes everything as **one website** on GitHub Pages (`docs/index.html`, reading `docs/latest.json`), plus the classic
+  one-page report (`docs/report.html`) and a 45-day archive.
+
+This project now also contains the former **Indian Stock Radar** (your own watchlist, market news and calculators), so there
+is a single repo, a single daily job and a single site.
 
 > **Educational / research use only. Not investment advice.** See the disclaimer in every report.
+
+## The website (`docs/`)
+One self-contained page (no CDN, works offline once loaded, installable on a phone) with ten tabs:
+
+| Tab | What it shows | Comes from |
+|---|---|---|
+| Overview | Market pulse, overnight cues, key counts, top ideas from every list, headlines | both |
+| Intraday (MIS) | Long and short triggers, stops, targets, "do not chase" level, quantity | screener |
+| CNC delivery | Full-match delivery ideas with a buy-zone / stop / target ladder and sized quantity | screener |
+| Price brackets | Top 10 in each of 10 price brackets, with rotation tags (New / Day N) | screener |
+| Fresh signals | Breakouts and volume surges | screener |
+| Quality 22 | 22-filter small-cap shortlist, closest misses, which filters remove most stocks | screener |
+| My watchlist | Scanner, chart with 20/50 EMA, entry and exit planner, fundamentals for your own symbols | radar |
+| News | Latest Economic Times and Mint headlines, tagged to your watchlist | radar |
+| Tools | Position sizer, daily loss guard, copy-ready order ticket | radar |
+| My book | Price alerts and buy-price tracker, checked against the last close (saved in your browser only) | radar |
+
+Type any ticker in the search box to see **everything the site knows about it in one place** (watchlist, CNC, intraday,
+bracket rank, fresh signal, quality score). Stocks show small tags when they appear on more than one list.
+
+`docs/index.html` is hand-written and is never overwritten by the job; the job only writes `latest.json`, `report.html` and
+`archive/`. To preview locally: `python -m http.server -d docs` and open http://localhost:8000.
+
+### Your watchlist (`watchlist.json`)
+```json
+[{"symbol": "SUZLON", "name": "Suzlon Energy Ltd", "sector": "Renewable Energy", "mode": "CNC"},
+ {"symbol": "MAHABANK", "name": "Bank of Maharashtra", "mode": "INTRADAY", "custom_buy": 63.5}]
+```
+`mode` is `CNC` or `INTRADAY`; `custom_buy` (optional) replaces the computed buy zone with your own price. Edit the file in
+GitHub (works from a phone) and the next run picks it up. Alternatively publish a Google Sheet as CSV with columns
+`Symbol, Name, Sector, Mode, My_Buy_Price` and save its URL as the repo secret `GOOGLE_SHEET_CSV_URL`; it overrides the file.
+Watchlist stocks use exactly the same indicators and level maths as the bracket report, so a stock shows the same buy zone,
+stop and targets everywhere. Switch it off with `RADAR=0` or `--no-radar`.
 
 ## What each row contains
 Stock name + NSE ticker · CMP · buy zone · target 1–4 weeks · target 1–3 months · stop-loss · reward:risk · one-line rationale.
@@ -144,7 +182,7 @@ most of any one portfolio's result usually comes from one or two stocks.
 
 ## Setup (≈15 minutes, free)
 1. **Create a GitHub repo** (github.com → New). *Public* is recommended: unlimited Actions minutes and free GitHub Pages. Private repos get 2,000 min/month (this job uses ~10 min/day ≈ 220/month) but need a paid plan for Pages.
-2. **Upload this folder's contents**, keeping the structure: `screener.py`, `quality.py`, `requirements.txt`, `README.md`, `.gitignore`, `tests/`, and `.github/workflows/daily-screener.yml`. (Unzip first; drag the files into the repo page → Commit. If `.github` is hidden on your OS, enable "show hidden files".)
+2. **Upload this folder's contents**, keeping the structure: `screener.py`, `desk.py`, `quality.py`, `radar.py`, `notify_telegram.py`, `watchlist.json`, `requirements.txt`, `README.md`, `.gitignore`, `docs/`, `tests/`, and `.github/workflows/daily-screener.yml`. (Unzip first; drag the files into the repo page → Commit. If `.github` is hidden on your OS, enable "show hidden files".)
 3. **Gmail App Password**: Google Account → Security → turn on 2-Step Verification → search "App passwords" → create one named `screener` → copy the 16 characters.
 4. **Add secrets**: repo → Settings → Secrets and variables → Actions → New repository secret:
 
@@ -168,10 +206,11 @@ GitHub may disable scheduled workflows in a repo with no activity for 60 days; t
 ## Run it locally
 ```bash
 pip install -r requirements.txt
-python tests/test_offline.py        # logic tests, no network needed
-python screener.py --no-email       # real run; writes docs/index.html
+python tests/test_offline.py        # logic tests, no network needed (also test_desk, test_telegram, test_radar)
+python screener.py --no-email       # real run; writes docs/latest.json (the site's data) and docs/report.html
 python screener.py --limit 60 -v    # quick debug run on 60 symbols
 python screener.py --no-quality     # skip the 22-filter quality shortlist
+python screener.py --no-radar       # skip the watchlist and headlines
 ```
 Tuning (environment variables): `UNIVERSE=all|total|500`, `MIN_TURNOVER_CR=5`, `MIN_PRICE=20`, `QUALITY_SCREEN=0`. Everything else is in the `Config` dataclass at the top of `screener.py`.
 
