@@ -47,6 +47,11 @@ try:  # 22-filter quality small-cap screen (quality.py, same folder). Optional: 
 except ImportError:  # pragma: no cover
     quality = None
 
+try:  # intraday watchlist, CNC shortlist, market pulse, news flags, position sizing (desk.py). Optional too.
+    import desk
+except ImportError:  # pragma: no cover
+    desk = None
+
 log = logging.getLogger("screener")
 IST = timezone(timedelta(hours=5, minutes=30))
 TICK = 0.05  # NSE tick size for most equities
@@ -340,6 +345,8 @@ def compute_features(df: pd.DataFrame, cfg: Config, today: datetime | None = Non
     return {
         "date": df.index[-1].date(),
         "close": close,
+        "open": float(df["Open"].iloc[-1]) if "Open" in df and not math.isnan(float(df["Open"].iloc[-1])) else close,
+        "high": float(h.iloc[-1]), "low": float(l.iloc[-1]),
         "chg_pct": float((c.iloc[-1] / c.iloc[-2] - 1) * 100),
         "ema20": float(e20.iloc[-1]), "ema50": float(e50.iloc[-1]),
         "ema200": float(e200.iloc[-1]) if not math.isnan(float(e200.iloc[-1])) else math.nan,
@@ -810,13 +817,15 @@ def render_html(report: dict, cfg: Config, web: bool = True) -> str:
 
     nav = ""
     if web:
-        nav = '<div class="nav">' + ('<a href="#fresh">Fresh signals</a>' if "fresh" in report else "")
+        nav = '<div class="nav">' + (desk.nav_links() if report.get("desk") else "")
+        nav += ('<a href="#fresh">Fresh signals</a>' if "fresh" in report else "")
         if report.get("quality"):
             nav += '<a href="#quality">Quality shortlist</a>'
         nav += "".join(f'<a href="#b{i}">{escape(b["label"])}</a>' for i, b in enumerate(report["brackets"]))
         nav += "</div>"
     quality_html = quality.render_html_section(report["quality"]) if report.get("quality") else ""
     fresh_html = render_fresh_html(report.get("fresh"), st) if "fresh" in report else ""
+    desk_html = desk.render_html(report["desk"]) if (desk and report.get("desk")) else ""
 
     sections = []
     for i, b in enumerate(report["brackets"]):
@@ -875,20 +884,22 @@ def render_html(report: dict, cfg: Config, web: bool = True) -> str:
     return (
         '<!doctype html><html lang="en"><head><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
-        f"<title>NSE Daily Price-Bracket Screener - {d}</title><style>{CSS}</style></head><body>"
+        f"<title>NSE Daily Trading Desk - {d}</title><style>{CSS}{desk.CSS if desk else ''}</style></head><body>"
         '<div class="wrap">'
-        f"<h1>NSE Daily Price-Bracket Screener</h1>"
+        f"<h1>NSE Daily Trading Desk</h1>"
         f'<div class="sub">Based on closing prices of <strong>{d}</strong> (last completed session) · '
         f"generated {gen} · CMP = last close, not a live quote</div>"
-        f"{market}{nav}{changes_banner(report)}{fresh_html}{quality_html}{''.join(sections)}{method}"
+        f"{market}{nav}{desk_html}{changes_banner(report)}{fresh_html}{quality_html}{''.join(sections)}{method}"
         f'<div class="sm" style="margin-top:8px">{stats_line}</div>'
         f'<div class="foot">{DISCLAIMER}</div></div></body></html>'
     )
 
 
 def render_text(report: dict) -> str:
-    out = [f"NSE Daily Price-Bracket Screener - data as of {report['data_date']}",
+    out = [f"NSE Daily Trading Desk - data as of {report['data_date']}",
            "(Open the attached HTML for the full tables.)", ""]
+    if desk and report.get("desk"):
+        out.append(desk.render_text(report["desk"]))
     if "fresh" in report:
         out.append(render_fresh_text(report["fresh"]))
     if report.get("quality"):
@@ -937,7 +948,7 @@ def send_email(report: dict, html: str) -> None:
     if not (user and pwd and to):
         raise RuntimeError("Email not configured: set SMTP_USER, SMTP_PASS and EMAIL_TO")
     msg = EmailMessage()
-    msg["Subject"] = f"NSE Stock Screener - {report['data_date']} (Top picks by price bracket)"
+    msg["Subject"] = f"NSE Trading Desk - {report['data_date']} (Intraday + CNC picks)"
     msg["From"] = os.environ.get("EMAIL_FROM", user)
     msg["To"] = ", ".join(to)
     msg.set_content(render_text(report))
@@ -968,6 +979,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-email", action="store_true", help="generate report but do not send email")
     ap.add_argument("--force", action="store_true", help="run even if no new trading session since last run")
     ap.add_argument("--no-quality", action="store_true", help="skip the 22-filter quality small-cap screen")
+    ap.add_argument("--no-desk", action="store_true", help="skip the intraday watchlist, CNC shortlist and market pulse")
     ap.add_argument("--limit", type=int, default=0, help="debug: only screen the first N symbols")
     ap.add_argument("--universe", choices=["all", "total", "500"], default=os.environ.get("UNIVERSE", "all"),
                     help="all = every NSE EQ stock (default), total = Nifty Total Market (~750), 500 = Nifty 500")
@@ -1010,17 +1022,22 @@ def main(argv: list[str] | None = None) -> int:
     report = run_screen(hist, names, cfg, lambda syms: fetch_fundamentals(syms, cfg), now, streaks)
     report["market"] = market_context(cfg)
     run_quality = not args.no_quality and os.environ.get("QUALITY_SCREEN", "1").lower() not in ("0", "false", "no")
+    run_desk = not args.no_desk and os.environ.get("TRADING_DESK", "1").lower() not in ("0", "false", "no")
     if run_quality and quality is None:
         log.error("quality.py not found next to screener.py - skipping the quality shortlist")
         run_quality = False
+    if run_desk and desk is None:
+        log.error("desk.py not found next to screener.py - skipping intraday / CNC / market pulse")
+        run_desk = False
+    feats: dict[str, dict] = {}
+    if run_quality or run_desk:
+        for sym, df in hist.items():
+            f = compute_features(df, cfg, now)
+            if f is not None:
+                feats[sym] = f
     if run_quality:
         try:   # a failure here must never stop the main report or the email
             qcfg = quality.QualityConfig(data_dir=cfg.data_dir)
-            feats = {}
-            for sym, df in hist.items():
-                f = compute_features(df, cfg, now)
-                if f is not None:
-                    feats[sym] = f
             industries = dict(zip(uni["symbol"], uni["industry"].fillna("").astype(str)))
             report["quality"] = quality.screen(
                 feats, names, industries, qcfg, compute_levels,
@@ -1029,6 +1046,15 @@ def main(argv: list[str] | None = None) -> int:
                      report["quality"]["stats"]["evaluated"])
         except Exception as exc:  # noqa: BLE001
             log.error("Quality screen failed (report continues without it): %s", exc)
+    if run_desk:
+        try:   # same rule: intraday / CNC extras are optional, the bracket report must still go out
+            report["desk"] = desk.build_desk(feats, names, report, desk.DeskConfig.from_env())
+            dk = report["desk"]
+            log.info("Desk: %d long / %d short intraday, %d CNC ideas, %d symbols with news/results data",
+                     len(dk["intraday"]["long"]), len(dk["intraday"]["short"]), len(dk["cnc"]["rows"]),
+                     dk["events_found"])
+        except Exception as exc:  # noqa: BLE001
+            log.error("Trading desk failed (report continues without it): %s", exc)
     report["generated_at"] = now.strftime("%d %b %Y, %H:%M IST")
     html = render_html(report, cfg, web=True)
     write_outputs(report, html, cfg)

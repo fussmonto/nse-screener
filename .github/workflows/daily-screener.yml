@@ -30,7 +30,9 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run offline logic tests
-        run: python tests/test_offline.py
+        run: |
+          python tests/test_offline.py
+          python tests/test_desk.py
 
       - name: Run screener and send email
         env:
@@ -41,6 +43,13 @@ jobs:
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
           # Manual runs always regenerate, even if no new trading day exists
           FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' }}
+          # Optional: set these under Settings > Secrets and variables > Actions > Variables to size positions for you
+          INTRADAY_CAPITAL: ${{ vars.INTRADAY_CAPITAL }}
+          INTRADAY_RISK_PCT: ${{ vars.INTRADAY_RISK_PCT }}
+          INTRADAY_LEVERAGE: ${{ vars.INTRADAY_LEVERAGE }}
+          CNC_CAPITAL: ${{ vars.CNC_CAPITAL }}
+          CNC_RISK_PCT: ${{ vars.CNC_RISK_PCT }}
+          CNC_MAX_POSITION_PCT: ${{ vars.CNC_MAX_POSITION_PCT }}
         run: python screener.py
 
       - name: Commit dashboard and caches

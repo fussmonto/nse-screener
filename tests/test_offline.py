@@ -15,6 +15,12 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import screener as S  # noqa: E402
 import quality as Q  # noqa: E402
+import desk as D  # noqa: E402
+
+# main() also builds the trading desk; keep every test offline (no market-pulse / news downloads)
+D._real_fetch_events = D.fetch_events      # desk tests exercise the real one
+D.fetch_pulse = lambda: []
+D.fetch_events = lambda syms, ref, dc, now_utc=None: {}
 
 NOW = datetime(2026, 11, 13, 8, 30, tzinfo=S.IST)
 DATES = pd.bdate_range(end="2026-11-12", periods=260)
