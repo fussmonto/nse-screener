@@ -1,4 +1,4 @@
-# NSE Daily Price-Bracket Screener
+# NSE Daily Trading Desk (price-bracket screener + intraday + CNC)
 
 Every weekday morning this project downloads NSE price history, screens liquid stocks, picks the
 **Top 10 in each of 10 price brackets** (Below ₹100 … ₹901–1,000), and
@@ -30,6 +30,23 @@ Three things now prevent that:
 
 Rotation and signals are about **variety and timing, not about predicting winners**. A stock being new on the list says nothing about
 whether it will rise.
+
+## Trading desk: intraday (MIS) and CNC delivery - `desk.py`
+Added at the top of the email and dashboard, built from the same downloaded data:
+
+| Section | What it is |
+|---|---|
+| **Market pulse** | Nifty, Bank Nifty, India VIX, S&P 500, Nasdaq, Nikkei, Hang Seng, Brent, USD/INR plus a one-line read of overnight cues (US weak/strong, VIX elevated). |
+| **Intraday (MIS) watchlist** | Up to 8 long and 5 short candidates for the coming session. Liquid (20-day turnover ≥ ₹25 cr), ATR 1.5-6% of price. Each has a **trigger** (previous high/low ± 0.05 ATR), stop (0.4 ATR), Target 1 (0.6 ATR), Target 2 (1.0 ATR), a "skip if it opens beyond" level, and a sized quantity. These are *levels to watch*: nothing has fired at 8 AM. Act only if the trigger breaks after the first 15-minute candle. Square off before about 3:15 PM. |
+| **CNC delivery shortlist** | Up to 10 Full-match ideas from the bracket tables with reward:risk ≥ 1.5, max 2 per price bracket, marked "In buy zone" or "Wait for pullback", with quantity sized to risk. |
+| **News and results flags** | Latest headline (last 72 h, tagged ▲/▼) and next results date per candidate. A stock with results on the session date is dropped from intraday; results within 3 days drops it from CNC. |
+
+**Position sizing.** Quantity = capital × risk% ÷ (entry − stop), capped by a max position size. Defaults: intraday ₹1,00,000, 1% risk, no leverage; CNC ₹5,00,000, 0.75% risk, ≤ 12% per stock.
+Set your own under repo **Settings → Secrets and variables → Actions → Variables**: `INTRADAY_CAPITAL`, `INTRADAY_RISK_PCT`, `INTRADAY_LEVERAGE`, `CNC_CAPITAL`, `CNC_RISK_PCT`, `CNC_MAX_POSITION_PCT`. Blank = default.
+
+Turn it off with `TRADING_DESK=0` or `python screener.py --no-desk`. If it fails, the bracket report and email still go out.
+
+**Limits.** No live prices before the open, so no real-time signals. Yahoo news/results data is patchy for small stocks, so a missing flag does not mean no event. Short-selling is intraday only and some stocks are not shortable; check your broker's list. Mechanical, backtest-free rules: they are a starting list, not predictions.
 
 ## Screening logic
 | Step | Rule |
