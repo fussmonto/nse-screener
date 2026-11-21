@@ -48,6 +48,21 @@ Turn it off with `TRADING_DESK=0` or `python screener.py --no-desk`. If it fails
 
 **Limits.** No live prices before the open, so no real-time signals. Yahoo news/results data is patchy for small stocks, so a missing flag does not mean no event. Short-selling is intraday only and some stocks are not shortable; check your broker's list. Mechanical, backtest-free rules: they are a starting list, not predictions.
 
+## Telegram delivery - `notify_telegram.py`
+Every run also sends a phone-friendly summary to Telegram (market pulse, intraday triggers, CNC ideas, top 5 fresh breakouts),
+followed by the full HTML report as a file. It is independent of email: either can fail without stopping the other.
+
+Setup (5 minutes):
+1. In Telegram open **@BotFather** → `/newbot` → choose a name and a username ending in `bot` → copy the **token**.
+2. Open your new bot and press **Start** (send it any message). Bots cannot message you first.
+3. Get your **chat id**: open `https://api.telegram.org/bot<TOKEN>/getUpdates` in a browser and copy `"chat":{"id": ...}`
+   (or message **@userinfobot**). For a group, add the bot to the group, send a message there, and use the negative id.
+4. Repo → Settings → Secrets and variables → Actions → New repository secret: `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`
+   (several chats: comma-separate the ids).
+5. Run the workflow manually once (Actions → Daily NSE Screener → Run workflow) to test.
+
+`--no-email` also silences Telegram. Without the two secrets nothing is sent and nothing fails.
+
 ## Screening logic
 | Step | Rule |
 |---|---|

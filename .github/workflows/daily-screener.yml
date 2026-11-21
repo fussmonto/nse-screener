@@ -33,6 +33,7 @@ jobs:
         run: |
           python tests/test_offline.py
           python tests/test_desk.py
+          python tests/test_telegram.py
 
       - name: Run screener and send email
         env:
@@ -41,6 +42,9 @@ jobs:
           SMTP_USER: ${{ secrets.SMTP_USER }}
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          PAGES_URL: https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/
           # Manual runs always regenerate, even if no new trading day exists
           FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' }}
           # Optional: set these under Settings > Secrets and variables > Actions > Variables to size positions for you
