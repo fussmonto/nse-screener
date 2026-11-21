@@ -47,6 +47,11 @@ try:  # 22-filter quality small-cap screen (quality.py, same folder). Optional: 
 except ImportError:  # pragma: no cover
     quality = None
 
+try:  # Telegram delivery (notify_telegram.py). Optional.
+    import notify_telegram
+except ImportError:  # pragma: no cover
+    notify_telegram = None
+
 try:  # intraday watchlist, CNC shortlist, market pulse, news flags, position sizing (desk.py). Optional too.
     import desk
 except ImportError:  # pragma: no cover
@@ -1065,12 +1070,21 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.no_email:
         return 0
+    rc = 0
     try:
         send_email(report, render_html(report, cfg, web=False))
     except Exception as exc:  # noqa: BLE001
         log.error("Email failed: %s", exc)
-        return 1
-    return 0
+        rc = 1
+    if notify_telegram and notify_telegram.configured():
+        try:   # Telegram is independent of email: either can fail without stopping the other
+            pages = os.environ.get("PAGES_URL", "").strip()
+            if not notify_telegram.send_report(report, render_html(report, cfg, web=False), pages):
+                rc = 1
+        except Exception as exc:  # noqa: BLE001
+            log.error("Telegram failed: %s", exc)
+            rc = 1
+    return rc
 
 
 if __name__ == "__main__":
